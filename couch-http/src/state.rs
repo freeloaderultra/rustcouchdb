@@ -87,8 +87,23 @@ impl Database {
 
     fn refresh(&self, seq: u64) -> ApiResult<()> {
         let db = Db::open(&self.path)?;
-        *self.snap.write().unwrap() = Arc::new(db);
-        let _ = self.seq_tx.send(seq);
+        // refresh() runs after the writer lock is dropped, so two writers can
+        // race here: only ever install a NEWER snapshot, or an acknowledged
+        // write would disappear from reads until the next write lands.
+        {
+            let mut g = self.snap.write().unwrap();
+            if db.header.update_seq >= g.header.update_seq {
+                *g = Arc::new(db);
+            }
+        }
+        self.seq_tx.send_if_modified(|cur| {
+            if seq > *cur {
+                *cur = seq;
+                true
+            } else {
+                false
+            }
+        });
         Ok(())
     }
 
