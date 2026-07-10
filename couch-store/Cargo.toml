@@ -1,0 +1,18 @@
+[package]
+name = "couch-store"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust storage engine for CouchDB .couch files (couch_file/couch_btree/couch_key_tree port)"
+license = "Apache-2.0"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+snap = "1"
+flate2 = "1"
+md-5 = "0.10"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+base64 = "0.22"
+
+[profile.release]
+lto = true
