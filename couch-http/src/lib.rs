@@ -14,6 +14,7 @@ pub mod error;
 pub mod jsfilter;
 pub mod repl;
 pub mod state;
+pub mod ui;
 pub mod util;
 pub mod validate;
 
@@ -57,6 +58,8 @@ pub fn router(app: App) -> Router {
         .route("/_uuids", get(api_root::uuids))
         .route("/_active_tasks", get(api_root::active_tasks))
         .route("/_replicate", post(api_repl::replicate))
+        .route("/_utils", get(ui::utils))
+        .route("/_utils/{*path}", get(ui::utils))
         .route("/_scheduler/jobs", get(api_root::scheduler_jobs))
         .route("/_scheduler/docs", get(api_root::scheduler_docs))
         .route("/_scheduler/docs/_replicator", get(api_root::scheduler_docs))

@@ -92,7 +92,11 @@ pub async fn require_admin(
         return next.run(req).await;
     }
     let path = req.uri().path();
-    if path == "/" || path == "/_up" || path == "/_session" {
+    // /_utils is the static admin UI shell: it must load unauthenticated so
+    // its login page can render (the data endpoints stay guarded).
+    if path == "/" || path == "/_up" || path == "/_session" || path == "/_utils"
+        || path.starts_with("/_utils/")
+    {
         return next.run(req).await;
     }
     if authenticate(&state, req.headers()).is_some() {

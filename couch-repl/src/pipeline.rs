@@ -90,6 +90,7 @@ pub async fn replicate(
     }
 
     let ledger = Arc::new(SeqLedger::new());
+    ledger.attach_stats(stats.clone());
 
     let (checkpointer, ckpt_seq) = if opts.use_checkpoints {
         let (c, seq) = Checkpointer::load(

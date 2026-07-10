@@ -631,3 +631,24 @@ async fn auth_and_soft_delete_validator() {
     .await;
     assert_eq!(s, 200); // deletions answer 200
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn utils_admin_ui() {
+    let srv = start(Some("admin:secret"), true).await;
+    let c = client();
+    let b = &srv.base;
+
+    // The UI shell loads without credentials so the login page can render.
+    for path in ["/_utils", "/_utils/", "/_utils/index.html"] {
+        let r = c.get(format!("{b}{path}")).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 200, "{path}");
+        let ct = r.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+        assert!(ct.starts_with("text/html"), "{path}: {ct}");
+        let body = r.text().await.unwrap();
+        assert!(body.contains("rustcouchdb"), "{path}");
+        assert!(body.contains("/_session"), "{path}: login flow missing");
+    }
+    // Data endpoints stay guarded.
+    let r = c.get(format!("{b}/_all_dbs")).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+}

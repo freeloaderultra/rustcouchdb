@@ -3,6 +3,11 @@ use std::time::Instant;
 
 #[derive(Default)]
 pub struct Stats {
+    /// Gauge, not a counter: changes read from the feed but not yet fully
+    /// processed (written, filtered, or verified present). Maintained by the
+    /// SeqLedger; 0 whenever the replication is idle — the semantics CouchDB
+    /// consumers expect from `changes_pending`.
+    pub changes_pending: AtomicU64,
     pub changes_read: AtomicU64,
     pub docs_filtered: AtomicU64,
     pub missing_checked: AtomicU64,

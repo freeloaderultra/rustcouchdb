@@ -72,10 +72,11 @@ impl Job {
 
     fn stats_json(&self) -> Value {
         let s = &self.stats;
-        let read = s.get(&s.changes_read);
         let written = s.get(&s.docs_written);
         json!({
-            "changes_pending": read.saturating_sub(s.get(&s.docs_read)),
+            // Gauge kept by the SeqLedger: 0 exactly when the job is idle
+            // (filtered changes count as processed, unlike docs_read).
+            "changes_pending": s.get(&s.changes_pending),
             "docs_read": s.get(&s.docs_read),
             "docs_written": written,
             "doc_write_failures": s.get(&s.doc_write_failures),

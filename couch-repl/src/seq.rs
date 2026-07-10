@@ -1,5 +1,6 @@
+use crate::stats::Stats;
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Tracks which source-sequence prefixes are fully replicated.
 ///
@@ -18,6 +19,8 @@ struct Inner {
     /// entry stays until everything before it is complete too.
     entries: BTreeMap<u64, Entry>,
     committable: Option<String>,
+    /// Mirrors entries.len() into Stats::changes_pending after each mutation.
+    gauge: Option<Arc<Stats>>,
 }
 
 struct Entry {
@@ -32,8 +35,16 @@ impl SeqLedger {
                 next_ord: 0,
                 entries: BTreeMap::new(),
                 committable: None,
+                gauge: None,
             }),
         }
+    }
+
+    /// Mirror the in-flight count into `stats.changes_pending` from now on.
+    pub fn attach_stats(&self, stats: Arc<Stats>) {
+        let mut g = self.inner.lock().unwrap();
+        g.gauge = Some(stats);
+        g.sync_gauge();
     }
 
     /// Register a change with one outstanding unit of work; returns its ordinal.
@@ -42,6 +53,7 @@ impl SeqLedger {
         let ord = g.next_ord;
         g.next_ord += 1;
         g.entries.insert(ord, Entry { seq, pending: 1 });
+        g.sync_gauge();
         ord
     }
 
@@ -53,6 +65,7 @@ impl SeqLedger {
         g.next_ord += 1;
         g.entries.insert(ord, Entry { seq, pending: 0 });
         g.advance();
+        g.sync_gauge();
     }
 
     /// A change turned out to need `units` units of work (one per missing rev).
@@ -75,6 +88,7 @@ impl SeqLedger {
             e.pending = e.pending.saturating_sub(1);
         }
         g.advance();
+        g.sync_gauge();
     }
 
     /// Highest seq safe to record in a checkpoint right now.
@@ -89,6 +103,13 @@ impl SeqLedger {
 }
 
 impl Inner {
+    fn sync_gauge(&self) {
+        if let Some(s) = &self.gauge {
+            s.changes_pending
+                .store(self.entries.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     fn advance(&mut self) {
         while let Some((&ord, entry)) = self.entries.iter().next() {
             if entry.pending > 0 {

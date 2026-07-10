@@ -41,8 +41,13 @@ docker run -p 5984:5984 -v rustcouchdb-data:/data \
   supervised restarts; states written back to the doc, live stats in
   `_scheduler/docs` and `_active_tasks`
 - **validate_doc_update, natively**: `--soft-delete-validator` enforces
-  nxguide's soft-delete metadata rule as compiled Rust; the JS design doc is
-  accepted and stored as inert data.
+  the soft-delete metadata rule as compiled Rust on databases where the
+  client installed its validator design doc; the JS body is stored inert.
+- **`/_utils` admin UI**: a Fauxton-style single-page interface embedded in
+  the binary (no external assets) — session login, databases, document
+  browsing/editing, Mango queries, index management, replication status and
+  active tasks. Everything this server doesn't do (clustering, per-database
+  users) simply isn't in the UI.
 
 ## Verification (against CouchDB 3.5.1, aarch64)
 

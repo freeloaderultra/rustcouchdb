@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rustcouchdb</title>
+<style>
+:root{--red:#c33;--dark:#24282e;--dark2:#2e343b;--line:#e3e6e8;--txt:#333;--mut:#777}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.5 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--txt);background:#f4f5f6}
+a{color:var(--red);text-decoration:none}
+#topbar{display:flex;align-items:center;gap:12px;background:var(--dark);color:#fff;padding:0 16px;height:46px}
+#topbar .logo{font-weight:700;letter-spacing:.4px}
+#topbar .logo span{color:var(--red)}
+.space{flex:1}
+#topbar .who{color:#aab;font-size:12px}
+#layout{display:flex;min-height:calc(100vh - 46px)}
+#side{width:190px;background:var(--dark2);padding:10px 0;flex-shrink:0}
+#side a{display:block;color:#cfd4d9;padding:9px 18px;font-size:13px}
+#side a.on,#side a:hover{background:#3a424b;color:#fff}
+#side .sect{color:#8a939c;font-size:11px;text-transform:uppercase;letter-spacing:.6px;padding:12px 18px 4px}
+#main{flex:1;padding:20px;min-width:0}
+h1{font-size:18px;margin:0 0 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+h1 .crumb{color:var(--mut);font-weight:400}
+table{border-collapse:collapse;width:100%;background:#fff;border:1px solid var(--line)}
+th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;font-size:13px;vertical-align:top;word-break:break-all}
+th{background:#fafbfc;font-weight:600}
+tr.click{cursor:pointer}
+tr.click:hover td{background:#f6f8fa}
+.btn{display:inline-block;border:1px solid #c9cdd1;background:#fff;color:#333;border-radius:3px;padding:6px 12px;font-size:13px;cursor:pointer}
+.btn.primary{background:var(--red);border-color:var(--red);color:#fff}
+.btn.danger{color:#b22;border-color:#d99}
+.btn:disabled{opacity:.5;cursor:default}
+input[type=text],input[type=password]{border:1px solid #c9cdd1;border-radius:3px;padding:7px 9px;font-size:13px;width:100%}
+textarea{width:100%;border:1px solid #c9cdd1;border-radius:3px;font:12px/1.5 ui-monospace,Menlo,Consolas,monospace;padding:10px;min-height:260px;background:#fff}
+.row{display:flex;gap:10px;align-items:center;margin:10px 0;flex-wrap:wrap}
+.card{background:#fff;border:1px solid var(--line);border-radius:4px;padding:16px;max-width:860px}
+.badge{display:inline-block;border-radius:9px;padding:1px 9px;font-size:11px;background:#e8eaec;color:#555}
+.badge.running{background:#e2f2e5;color:#265}
+.badge.completed{background:#e4ecf7;color:#246}
+.badge.failed,.badge.crashing{background:#f7e4e4;color:#a22}
+#toast{position:fixed;bottom:18px;right:18px;z-index:9;display:flex;flex-direction:column;gap:8px}
+#toast div{background:#333;color:#fff;padding:10px 14px;border-radius:4px;font-size:13px;max-width:420px;word-break:break-word}
+#toast div.err{background:#a22}
+.mut{color:var(--mut)}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+#login{max-width:340px;margin:80px auto}
+#login .logo{text-align:center;font-size:22px;font-weight:700;margin-bottom:18px}
+#login .logo span{color:var(--red)}
+.kv{display:grid;grid-template-columns:170px 1fr;gap:4px 12px;font-size:13px}
+pre.res{background:#fff;border:1px solid var(--line);border-radius:4px;padding:12px;font-size:12px;overflow:auto;max-height:480px}
+label.chk{font-size:13px;display:flex;gap:6px;align-items:center}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="toast"></div>
+<script>
+"use strict";
+const $=(s,el)=>(el||document).querySelector(s);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const enc=encodeURIComponent;
+// crypto.randomUUID needs a secure context; devices are reached over plain http.
+const rnd=()=>Array.from({length:32},()=>"0123456789abcdef"[Math.random()*16|0]).join("");
+let session=null;
+
+function toast(msg,err){
+  const t=document.createElement("div");
+  t.textContent=msg; if(err)t.className="err";
+  $("#toast").appendChild(t);
+  setTimeout(()=>t.remove(),err?7000:3500);
+}
+
+async function api(method,path,body){
+  const opts={method,headers:{Accept:"application/json"},credentials:"same-origin"};
+  if(body!==undefined){opts.headers["Content-Type"]="application/json";opts.body=JSON.stringify(body);}
+  const res=await fetch(path,opts);
+  let data=null;
+  try{data=await res.json();}catch(e){}
+  if(res.status===401){session=null;render();throw new Error("unauthorized");}
+  if(!res.ok){
+    const reason=data&&(data.reason||data.error)||res.statusText;
+    throw new Error(res.status+" "+reason);
+  }
+  return data;
+}
+
+/* ---------- routing ---------- */
+function nav(){render().catch(e=>toast(e.message,true));}
+window.addEventListener("hashchange",nav);
+
+function route(){
+  const h=location.hash.replace(/^#\/?/,"").split("?")[0];
+  const p=h.split("/").map(decodeURIComponent);
+  if(p[0]==="db"&&p[1])return{page:p[3]||"docs",db:p[1],rest:p.slice(2)};
+  return{page:p[0]||"databases"};
+}
+function link(h){return "#/"+h;}
+
+/* ---------- shell ---------- */
+function shell(active,db,content){
+  const item=(href,label,key)=>`<a href="${href}" class="${active===key?"on":""}">${label}</a>`;
+  let dbnav="";
+  if(db){
+    dbnav=`<div class="sect">${esc(db)}</div>`+
+      item(link("db/"+enc(db)),"Documents","docs")+
+      item(link("db/"+enc(db)+"/x/query"),"Mango Query","query")+
+      item(link("db/"+enc(db)+"/x/indexes"),"Indexes","indexes");
+  }
+  return `
+  <div id="topbar">
+    <div class="logo">rust<span>couchdb</span></div>
+    <div class="space"></div>
+    <div class="who">${session&&session.name?esc(session.name):""}</div>
+    ${session&&session.name?'<button class="btn" id="logout">Log out</button>':""}
+  </div>
+  <div id="layout">
+    <div id="side">
+      <div class="sect">Server</div>
+      ${item("#/databases","Databases","databases")}
+      ${item("#/replication","Replication","replication")}
+      ${item("#/tasks","Active Tasks","tasks")}
+      ${dbnav}
+    </div>
+    <div id="main">${content}</div>
+  </div>`;
+}
+
+/* ---------- login ---------- */
+function loginPage(){
+  $("#app").innerHTML=`
+  <div id="login" class="card">
+    <div class="logo">rust<span>couchdb</span></div>
+    <div class="row"><input type="text" id="u" placeholder="Username" autocomplete="username"></div>
+    <div class="row"><input type="password" id="p" placeholder="Password" autocomplete="current-password"></div>
+    <div class="row"><button class="btn primary" id="go" style="width:100%">Log in</button></div>
+  </div>`;
+  const go=async()=>{
+    try{
+      await api("POST","/_session",{name:$("#u").value,password:$("#p").value});
+      session={name:$("#u").value};
+      location.hash="#/databases";
+      await render();
+    }catch(e){toast("Login failed: "+e.message,true);}
+  };
+  $("#go").onclick=go;
+  $("#p").addEventListener("keydown",e=>{if(e.key==="Enter")go();});
+  $("#u").focus();
+}
+
+/* ---------- databases ---------- */
+async function databasesPage(){
+  const dbs=await api("GET","/_all_dbs");
+  const rows=await Promise.all(dbs.map(async db=>{
+    try{
+      const i=await api("GET","/"+enc(db));
+      return {db,docs:i.doc_count,del:i.doc_del_count,size:i.sizes&&i.sizes.file||0};
+    }catch(e){return {db,docs:"?",del:"?",size:0};}
+  }));
+  const fmt=n=>typeof n!="number"?n:n>1048576?(n/1048576).toFixed(1)+" MB":n>1024?(n/1024).toFixed(1)+" KB":n+" B";
+  $("#app").innerHTML=shell("databases",null,`
+    <h1>Databases <span class="space"></span><button class="btn primary" id="new">Create Database</button></h1>
+    <table><tr><th>Name</th><th>Docs</th><th>Deleted</th><th>Size</th><th></th></tr>
+    ${rows.map(r=>`<tr class="click" data-db="${esc(r.db)}"><td><a href="${link("db/"+enc(r.db))}">${esc(r.db)}</a></td>
+      <td>${r.docs}</td><td>${r.del}</td><td>${fmt(r.size)}</td>
+      <td><button class="btn danger del" data-db="${esc(r.db)}">Delete</button></td></tr>`).join("")}
+    </table>`);
+  wireShell();
+  $("#new").onclick=async()=>{
+    const name=prompt("Database name (lowercase letters, digits, _$()+-):");
+    if(!name)return;
+    try{await api("PUT","/"+enc(name));toast("created "+name);await render();}
+    catch(e){toast(e.message,true);}
+  };
+  document.querySelectorAll(".del").forEach(b=>b.onclick=async ev=>{
+    ev.stopPropagation();
+    const db=b.dataset.db;
+    if(prompt('Type the database name to delete "'+db+'" permanently:')!==db)return;
+    try{await api("DELETE","/"+enc(db));toast("deleted "+db);await render();}
+    catch(e){toast(e.message,true);}
+  });
+}
+
+/* ---------- documents ---------- */
+async function docsPage(db,startkey){
+  const q=["limit=21","include_docs=true"];
+  if(startkey)q.push("startkey="+enc(JSON.stringify(startkey)));
+  const r=await api("GET","/"+enc(db)+"/_all_docs?"+q.join("&"));
+  const rows=r.rows.slice(0,20);
+  const more=r.rows.length>20?r.rows[20].id:null;
+  $("#app").innerHTML=shell("docs",db,`
+    <h1><a href="#/databases" class="crumb">Databases /</a> ${esc(db)}
+      <span class="space"></span><button class="btn primary" id="new">New Doc</button></h1>
+    <div class="row">
+      <input type="text" id="jump" placeholder="Jump to id prefix…" style="max-width:340px" value="${startkey?esc(startkey):""}">
+      <button class="btn" id="jumpgo">Go</button>
+    </div>
+    <table><tr><th style="width:45%">id</th><th>rev</th><th>summary</th></tr>
+    ${rows.map(row=>{
+      const d=row.doc||{};
+      const keys=Object.keys(d).filter(k=>!k.startsWith("_")).slice(0,6).join(", ");
+      return `<tr class="click" data-id="${esc(row.id)}"><td class="mono">${esc(row.id)}</td>
+        <td class="mono">${esc(row.value&&row.value.rev||"")}</td><td class="mut">${esc(keys)}</td></tr>`;
+    }).join("")}
+    </table>
+    <div class="row">
+      ${startkey?'<button class="btn" id="first">First page</button>':""}
+      ${more?'<button class="btn" id="next">Next page →</button>':""}
+    </div>`);
+  wireShell();
+  $("#new").onclick=()=>{location.hash=link("db/"+enc(db)+"/x/edit");};
+  const jump=()=>{const v=$("#jump").value.trim();location.hash=link("db/"+enc(db))+(v?"?"+enc(v):"");};
+  $("#jumpgo").onclick=jump;
+  $("#jump").addEventListener("keydown",e=>{if(e.key==="Enter")jump();});
+  if($("#next"))$("#next").onclick=()=>{docsPage(db,more).catch(e=>toast(e.message,true));};
+  if($("#first"))$("#first").onclick=()=>{location.hash=link("db/"+enc(db));docsPage(db).catch(e=>toast(e.message,true));};
+  document.querySelectorAll("tr.click[data-id]").forEach(tr=>tr.onclick=()=>{
+    location.hash=link("db/"+enc(db)+"/x/edit")+"?"+enc(tr.dataset.id);
+  });
+}
+
+async function editPage(db,docid){
+  let doc={_id:rnd()};
+  let atts=[];
+  if(docid){
+    doc=await api("GET","/"+enc(db)+"/"+enc(docid));
+    if(doc._attachments){
+      atts=Object.entries(doc._attachments).map(([n,a])=>({n,len:a.length,type:a.content_type}));
+    }
+  }
+  $("#app").innerHTML=shell("docs",db,`
+    <h1><a href="${link("db/"+enc(db))}" class="crumb">${esc(db)} /</a> ${docid?esc(docid):"new document"}</h1>
+    <textarea id="ed" spellcheck="false">${esc(JSON.stringify(doc,null,2))}</textarea>
+    ${atts.length?`<div class="card" style="margin-top:10px"><b>Attachments</b>
+      ${atts.map(a=>`<div class="row mono"><a href="/${enc(db)}/${enc(docid)}/${enc(a.n)}" target="_blank">${esc(a.n)}</a>
+        <span class="mut">${esc(a.type||"")} · ${a.len} bytes</span></div>`).join("")}</div>`:""}
+    <div class="row">
+      <button class="btn primary" id="save">Save</button>
+      ${docid?'<button class="btn danger" id="del">Delete</button>':""}
+      <a class="btn" href="${link("db/"+enc(db))}">Cancel</a>
+    </div>`);
+  wireShell();
+  $("#save").onclick=async()=>{
+    let body;
+    try{body=JSON.parse($("#ed").value);}catch(e){return toast("Invalid JSON: "+e.message,true);}
+    if(!body._id)return toast("_id is required",true);
+    try{
+      const r=await api("PUT","/"+enc(db)+"/"+enc(body._id),body);
+      toast("saved "+r.id+" @ "+r.rev);
+      location.hash=link("db/"+enc(db));
+    }catch(e){toast(e.message,true);}
+  };
+  if($("#del"))$("#del").onclick=async()=>{
+    if(!confirm("Delete "+docid+"?"))return;
+    try{
+      const cur=JSON.parse($("#ed").value);
+      await api("DELETE","/"+enc(db)+"/"+enc(docid)+"?rev="+enc(cur._rev));
+      toast("deleted "+docid);
+      location.hash=link("db/"+enc(db));
+    }catch(e){toast(e.message,true);}
+  };
+}
+
+/* ---------- mango query ---------- */
+async function queryPage(db){
+  const def=JSON.stringify({selector:{},limit:25},null,2);
+  $("#app").innerHTML=shell("query",db,`
+    <h1><a href="${link("db/"+enc(db))}" class="crumb">${esc(db)} /</a> Mango Query</h1>
+    <textarea id="q" spellcheck="false">${esc(def)}</textarea>
+    <div class="row">
+      <button class="btn primary" id="run">Run Query</button>
+      <button class="btn" id="explain">Explain</button>
+      <span class="mut" id="stats"></span>
+    </div>
+    <pre class="res" id="out">—</pre>`);
+  wireShell();
+  const parse=()=>{try{return JSON.parse($("#q").value);}catch(e){toast("Invalid JSON: "+e.message,true);}};
+  $("#run").onclick=async()=>{
+    const body=parse(); if(!body)return;
+    body.execution_stats=true;
+    try{
+      const t0=performance.now();
+      const r=await api("POST","/"+enc(db)+"/_find",body);
+      const ms=(performance.now()-t0).toFixed(0);
+      $("#out").textContent=JSON.stringify(r.docs,null,2);
+      const s=r.execution_stats||{};
+      $("#stats").textContent=`${(r.docs||[]).length} docs · ${ms} ms · keys ${s.total_keys_examined??"?"} · docs examined ${s.total_docs_examined??"?"}`+(r.warning?" · "+r.warning:"");
+    }catch(e){toast(e.message,true);}
+  };
+  $("#explain").onclick=async()=>{
+    const body=parse(); if(!body)return;
+    try{
+      const r=await api("POST","/"+enc(db)+"/_explain",body);
+      $("#out").textContent=JSON.stringify(r,null,2);
+      $("#stats").textContent="";
+    }catch(e){toast(e.message,true);}
+  };
+}
+
+/* ---------- indexes ---------- */
+async function indexesPage(db){
+  const r=await api("GET","/"+enc(db)+"/_index");
+  const def=JSON.stringify({index:{fields:["fieldname"]},name:"by-fieldname",type:"json"},null,2);
+  $("#app").innerHTML=shell("indexes",db,`
+    <h1><a href="${link("db/"+enc(db))}" class="crumb">${esc(db)} /</a> Indexes</h1>
+    <table><tr><th>ddoc</th><th>name</th><th>fields</th><th></th></tr>
+    ${(r.indexes||[]).map(ix=>{
+      const fields=(ix.def&&ix.def.fields||[]).map(f=>Object.keys(f)[0]).join(", ");
+      const deletable=ix.type==="json";
+      return `<tr><td class="mono">${esc(ix.ddoc||"—")}</td><td>${esc(ix.name)}</td><td class="mono">${esc(fields)}</td>
+      <td>${deletable?`<button class="btn danger delix" data-ddoc="${esc(ix.ddoc)}" data-name="${esc(ix.name)}">Delete</button>`:""}</td></tr>`;
+    }).join("")}
+    </table>
+    <div class="card" style="margin-top:16px">
+      <b>Create index</b>
+      <textarea id="ix" style="min-height:140px" spellcheck="false">${esc(def)}</textarea>
+      <div class="row"><button class="btn primary" id="mk">Create</button></div>
+    </div>`);
+  wireShell();
+  $("#mk").onclick=async()=>{
+    let body;
+    try{body=JSON.parse($("#ix").value);}catch(e){return toast("Invalid JSON: "+e.message,true);}
+    try{const res=await api("POST","/"+enc(db)+"/_index",body);toast(res.result+" "+res.id);await render();}
+    catch(e){toast(e.message,true);}
+  };
+  document.querySelectorAll(".delix").forEach(b=>b.onclick=async()=>{
+    const dd=b.dataset.ddoc.replace(/^_design\//,"");
+    if(!confirm("Delete index "+b.dataset.name+"?"))return;
+    try{await api("DELETE","/"+enc(db)+"/_index/"+enc(dd)+"/json/"+enc(b.dataset.name));toast("deleted");await render();}
+    catch(e){toast(e.message,true);}
+  });
+}
+
+/* ---------- replication ---------- */
+async function replicationPage(){
+  const r=await api("GET","/_scheduler/docs");
+  $("#app").innerHTML=shell("replication",null,`
+    <h1>Replication</h1>
+    <table><tr><th>doc</th><th>state</th><th>source → target</th><th>written / read</th><th></th></tr>
+    ${(r.docs||[]).map(d=>{
+      const i=d.info||{};
+      return `<tr><td class="mono">${esc(d.doc_id||"")}</td>
+      <td><span class="badge ${esc(d.state||"")}">${esc(d.state||"?")}</span>${i.error?`<div class="mut">${esc(String(i.error)).slice(0,120)}</div>`:""}</td>
+      <td class="mono">${esc(d.source||"")}<br>→ ${esc(d.target||"")}</td>
+      <td>${i.docs_written??"—"} / ${i.docs_read??"—"}</td>
+      <td><button class="btn danger deldoc" data-id="${esc(d.doc_id||"")}">Remove</button></td></tr>`;
+    }).join("")}
+    </table>
+    <div class="card" style="margin-top:16px">
+      <b>New replication</b>
+      <div class="row"><input type="text" id="src" placeholder="source URL or local db name"></div>
+      <div class="row"><input type="text" id="tgt" placeholder="target URL or local db name"></div>
+      <div class="row">
+        <label class="chk"><input type="checkbox" id="cont"> continuous</label>
+        <label class="chk"><input type="checkbox" id="ct"> create target</label>
+      </div>
+      <div class="row"><button class="btn primary" id="mk">Start</button></div>
+    </div>`);
+  wireShell();
+  $("#mk").onclick=async()=>{
+    const src=$("#src").value.trim(),tgt=$("#tgt").value.trim();
+    if(!src||!tgt)return toast("source and target are required",true);
+    const id="ui_repl_"+rnd().slice(0,8);
+    const body={source:src,target:tgt};
+    if($("#cont").checked)body.continuous=true;
+    if($("#ct").checked)body.create_target=true;
+    try{await api("PUT","/_replicator/"+enc(id),body);toast("replication "+id+" created");await render();}
+    catch(e){toast(e.message,true);}
+  };
+  document.querySelectorAll(".deldoc").forEach(b=>b.onclick=async()=>{
+    const id=b.dataset.id; if(!id)return;
+    if(!confirm("Remove replication doc "+id+"?"))return;
+    try{
+      const d=await api("GET","/_replicator/"+enc(id));
+      await api("DELETE","/_replicator/"+enc(id)+"?rev="+enc(d._rev));
+      toast("removed "+id);await render();
+    }catch(e){toast(e.message,true);}
+  });
+}
+
+/* ---------- active tasks ---------- */
+let taskTimer=null;
+async function tasksPage(){
+  const t=await api("GET","/_active_tasks");
+  $("#app").innerHTML=shell("tasks",null,`
+    <h1>Active Tasks <span class="mut" style="font-size:12px">(refreshes every 5s)</span></h1>
+    ${t.length?`<table><tr><th>type</th><th>what</th><th>progress</th></tr>
+      ${t.map(x=>`<tr><td>${esc(x.type||"")}</td>
+        <td class="mono">${esc(x.database||x.source||"")}${x.target?" → "+esc(x.target):""}</td>
+        <td>${x.progress!=null?x.progress+"%":""} <span class="mut">read ${x.docs_read??"—"} written ${x.docs_written??"—"}</span></td></tr>`).join("")}
+      </table>`:'<div class="card mut">No active tasks.</div>'}
+  `);
+  wireShell();
+  taskTimer=setTimeout(()=>{if(route().page==="tasks")tasksPage().catch(()=>{});},5000);
+}
+
+/* ---------- wire-up ---------- */
+function wireShell(){
+  const lo=$("#logout");
+  if(lo)lo.onclick=async()=>{
+    try{await api("DELETE","/_session");}catch(e){}
+    session=null;render();
+  };
+}
+
+async function render(){
+  if(taskTimer){clearTimeout(taskTimer);taskTimer=null;}
+  if(session===null){
+    try{
+      const s=await api("GET","/_session");
+      if(s&&s.userCtx&&s.userCtx.name)session={name:s.userCtx.name};
+    }catch(e){}
+  }
+  if(!session||!session.name){loginPage();return;}
+  const r=route();
+  // query strings inside the hash (e.g. #/db/x?startkey)
+  const extra=location.hash.includes("?")?decodeURIComponent(location.hash.split("?")[1]):null;
+  try{
+    if(r.page==="databases")await databasesPage();
+    else if(r.page==="replication")await replicationPage();
+    else if(r.page==="tasks")await tasksPage();
+    else if(r.db&&r.rest[1]==="query")await queryPage(r.db);
+    else if(r.db&&r.rest[1]==="indexes")await indexesPage(r.db);
+    else if(r.db&&r.rest[1]==="edit")await editPage(r.db,extra);
+    else if(r.db)await docsPage(r.db,extra);
+    else await databasesPage();
+  }catch(e){
+    if(e.message!=="unauthorized")toast(e.message,true);
+  }
+}
+render();
+</script>
+</body>
+</html>
