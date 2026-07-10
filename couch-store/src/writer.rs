@@ -587,6 +587,67 @@ impl DbWriter {
     }
 
     /// Replace the `_security` object (takes effect at the next commit).
+    /// couch_db:purge_docs — physically remove the given leaf revisions.
+    /// No tombstones, nothing replicates. A doc whose last leaf is purged
+    /// vanishes from the by-id and by-seq trees; a doc with surviving leaves
+    /// is reindexed under a fresh update_seq (its winner may have changed).
+    /// Returns what was actually removed, per doc.
+    pub fn purge_docs(
+        &mut self,
+        req: &[(Vec<u8>, Vec<(u64, Vec<u8>)>)],
+    ) -> Result<Vec<(Vec<u8>, Vec<(u64, Vec<u8>)>)>> {
+        let mut purged = Vec::new();
+        let mut id_inserts = Vec::new();
+        let mut id_removes = Vec::new();
+        let mut seq_inserts = Vec::new();
+        let mut seq_removes = Vec::new();
+        for (id, revs) in req {
+            let key = Term::Bin(id.clone());
+            let found = btree::lookup(&self.file, &self.id_root, std::slice::from_ref(&key))?
+                .pop()
+                .flatten();
+            let Some(v) = found else {
+                purged.push((id.clone(), Vec::new()));
+                continue;
+            };
+            let fdi = Db::fdi_from_id_kv(&key, &v)?;
+            let mut tree = fdi.rev_tree;
+            let removed = tree.remove_leaves(revs);
+            if removed.is_empty() {
+                purged.push((id.clone(), removed));
+                continue;
+            }
+            seq_removes.push(Term::Int(fdi.update_seq as i64));
+            if tree.leaves().is_empty() {
+                id_removes.push(key);
+            } else {
+                self.update_seq += 1;
+                if let Some((pos, revid)) = tree.winner().map(|w| (w.pos, w.path[0].to_vec())) {
+                    tree.set_leaf_seq(pos, &revid, self.update_seq);
+                }
+                let fdi_val = fdi_value(&tree)?;
+                seq_inserts.push((Term::Int(fdi_val.update_seq as i64), seq_value(id, &fdi_val)));
+                id_inserts.push((Term::Bin(id.clone()), fdi_val.id_term));
+            }
+            purged.push((id.clone(), removed));
+        }
+        self.id_root = btree::add_remove(
+            &mut self.file,
+            &self.id_root,
+            Reducer::IdTree,
+            id_inserts,
+            id_removes,
+        )?;
+        self.seq_root = btree::add_remove(
+            &mut self.file,
+            &self.seq_root,
+            Reducer::SeqTree,
+            seq_inserts,
+            seq_removes,
+        )?;
+        Ok(purged)
+    }
+
     pub fn set_security(&mut self, v: &Value) -> Result<()> {
         let inner = match ejson::from_json(v) {
             Term::Tuple(mut t) if t.len() == 1 => t.remove(0),

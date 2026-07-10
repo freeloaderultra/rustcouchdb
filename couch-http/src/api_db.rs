@@ -135,3 +135,70 @@ pub async fn revs_limit_get(State(state): State<App>, Path(db): Path<String>) ->
     let snap = dbh.snapshot();
     Ok(Json(Value::from(snap.header.revs_limit)).into_response())
 }
+
+/// POST /{db}/_purge — physically remove leaf revisions (couch_db:purge_docs).
+/// Body: {"docid": ["rev", ...], ...}. Purged docs vanish without tombstones;
+/// index entries are dropped in the same call, since purges never reach the
+/// changes feed the incremental updater follows.
+pub async fn purge(
+    State(state): State<App>,
+    Path(db): Path<String>,
+    body: bytes::Bytes,
+) -> ApiResult<Response> {
+    let v = parse_json(&body)?;
+    let Value::Object(map) = v else {
+        return Err(ApiError::bad_request("purge body must be {docid: [revs]}"));
+    };
+    let mut req: Vec<(Vec<u8>, Vec<(u64, Vec<u8>)>)> = Vec::new();
+    for (id, revs) in &map {
+        let revs = revs
+            .as_array()
+            .ok_or_else(|| ApiError::bad_request("revs must be an array"))?
+            .iter()
+            .map(|r| {
+                r.as_str()
+                    .ok_or_else(|| ApiError::bad_request("revs must be strings"))
+                    .and_then(|s| {
+                        couch_store::doc::parse_rev(s)
+                            .map_err(|_| ApiError::bad_request(format!("invalid rev: {s}")))
+                    })
+            })
+            .collect::<ApiResult<Vec<_>>>()?;
+        req.push((id.as_bytes().to_vec(), revs));
+    }
+    let dbh = state.db(&db)?;
+    // Hold the index lock across store purge + index cleanup so a concurrent
+    // _find cannot observe entries for already-purged docs.
+    let lock_db = dbh.clone();
+    let _guard = lock_db.index_lock.lock().await;
+    blocking(move || {
+        let purged = dbh.with_writer(|w| w.purge_docs(&req))?;
+        let touched: Vec<Vec<u8>> = purged
+            .iter()
+            .filter(|(_, revs)| !revs.is_empty())
+            .map(|(id, _)| id.clone())
+            .collect();
+        if !touched.is_empty() {
+            let dir = couch_index::index::index_dir(&dbh.path);
+            for mut idx in couch_index::index::list(&dir)? {
+                idx.purge_ids(&touched)?;
+            }
+        }
+        let mut out = serde_json::Map::new();
+        for (id, revs) in purged {
+            out.insert(
+                String::from_utf8_lossy(&id).into_owned(),
+                Value::Array(
+                    revs.into_iter()
+                        .map(|(pos, rid)| Value::String(couch_store::doc::rev_str(pos, &rid)))
+                        .collect(),
+                ),
+            );
+        }
+        Ok((
+            StatusCode::CREATED,
+            Json(json!({"purge_seq": Value::Null, "purged": out})),
+        )
+            .into_response())
+    })
+}

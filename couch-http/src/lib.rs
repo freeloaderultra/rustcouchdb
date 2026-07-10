@@ -75,6 +75,7 @@ pub fn router(app: App) -> Router {
                 .post(api_docs::doc_post),
         )
         .route("/{db}/_ensure_full_commit", post(api_db::ensure_full_commit))
+        .route("/{db}/_purge", post(api_db::purge))
         .route("/{db}/_compact", post(api_db::compact_db))
         .route("/{db}/_compact/{ddoc}", post(api_db::view_cleanup))
         .route("/{db}/_view_cleanup", post(api_db::accepted_noop))

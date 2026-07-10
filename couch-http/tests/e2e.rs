@@ -652,3 +652,78 @@ async fn utils_admin_ui() {
     let r = c.get(format!("{b}/_all_dbs")).send().await.unwrap();
     assert_eq!(r.status().as_u16(), 401);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn purge_docs() {
+    let srv = start(None, false).await;
+    let c = client();
+    let b = &srv.base;
+    assert_eq!(jput(&c, &format!("{b}/pdb"), &json!({})).await.0, 201);
+
+    // Two docs + a Mango index built over them BEFORE the purge.
+    let (_, v) = jput(&c, &format!("{b}/pdb/keep"), &json!({"t": "x"})).await;
+    let _keep_rev = v["rev"].as_str().unwrap().to_string();
+    let (_, v) = jput(&c, &format!("{b}/pdb/gone"), &json!({"t": "x"})).await;
+    let gone_rev = v["rev"].as_str().unwrap().to_string();
+    let (s, _) = jpost(
+        &c,
+        &format!("{b}/pdb/_index"),
+        &json!({"index": {"fields": ["t"]}, "name": "by-t", "type": "json"}),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (_, r) = jpost(&c, &format!("{b}/pdb/_find"), &json!({"selector": {"t": "x"}})).await;
+    assert_eq!(r["docs"].as_array().unwrap().len(), 2);
+
+    // Purge the winner rev: doc fully gone, no tombstone.
+    let (s, v) = jpost(&c, &format!("{b}/pdb/_purge"), &json!({"gone": [gone_rev]})).await;
+    assert_eq!(s, 201);
+    assert_eq!(v["purged"]["gone"].as_array().unwrap().len(), 1);
+    let (s, v) = jget(&c, &format!("{b}/pdb/gone")).await;
+    assert_eq!((s, v["reason"].as_str().unwrap()), (404, "missing")); // not "deleted"
+    let (_, v) = jget(&c, &format!("{b}/pdb/_all_docs")).await;
+    assert_eq!(v["total_rows"], json!(1));
+    let (_, v) = jget(&c, &format!("{b}/pdb/_changes")).await;
+    let ids: Vec<&str> = v["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert!(!ids.contains(&"gone"), "purged doc must vanish from _changes: {ids:?}");
+    // The index must not serve entries for the purged doc.
+    let (_, r) = jpost(&c, &format!("{b}/pdb/_find"), &json!({"selector": {"t": "x"}})).await;
+    let found: Vec<&str> = r["docs"].as_array().unwrap().iter().map(|d| d["_id"].as_str().unwrap()).collect();
+    assert_eq!(found, vec!["keep"]);
+    // doc_count reflects the purge.
+    let (_, v) = jget(&c, &format!("{b}/pdb")).await;
+    assert_eq!(v["doc_count"], json!(1));
+
+    // Conflict branches: purge only the winning branch, loser takes over.
+    let mk = |rev: &str, val: u32| json!({"_id": "cft", "_rev": rev, "v": val});
+    let bulk = json!({"new_edits": false, "docs": [
+        {"_id": "cft", "_rev": "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "v": 1},
+        {"_id": "cft", "_rev": "1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "v": 2},
+    ]});
+    let _ = mk; // silence
+    let (s, _) = jpost(&c, &format!("{b}/pdb/_bulk_docs"), &bulk).await;
+    assert_eq!(s, 201);
+    let (_, v) = jget(&c, &format!("{b}/pdb/cft")).await;
+    assert_eq!(v["_rev"], json!("1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")); // winner
+    let (s, v) = jpost(
+        &c,
+        &format!("{b}/pdb/_purge"),
+        &json!({"cft": ["1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]}),
+    )
+    .await;
+    assert_eq!(s, 201);
+    assert_eq!(v["purged"]["cft"].as_array().unwrap().len(), 1);
+    let (s, v) = jget(&c, &format!("{b}/pdb/cft")).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["_rev"], json!("1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")); // loser survives
+
+    // Purging an unknown rev is a no-op with an empty purged list.
+    let (s, v) = jpost(
+        &c,
+        &format!("{b}/pdb/_purge"),
+        &json!({"cft": ["9-cccccccccccccccccccccccccccccccc"]}),
+    )
+    .await;
+    assert_eq!(s, 201);
+    assert_eq!(v["purged"]["cft"].as_array().unwrap().len(), 0);
+}

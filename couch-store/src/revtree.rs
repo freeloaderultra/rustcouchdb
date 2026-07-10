@@ -154,6 +154,62 @@ impl RevTree {
         self.0 = new_tree.0;
     }
 
+    /// couch_key_tree:remove_leafs — drop the given LEAF revisions (ancestors
+    /// that no surviving leaf path needs disappear with them). Non-leaf revs
+    /// are ignored, like CouchDB. Returns the (pos, revid) pairs removed.
+    pub fn remove_leaves(&mut self, revs: &[(u64, Vec<u8>)]) -> Vec<(u64, Vec<u8>)> {
+        let paths = self.full_leaf_paths();
+        let mut removed = Vec::new();
+        let mut keep: Vec<(u64, Vec<(Vec<u8>, RevVal)>)> = Vec::new();
+        for (pos, path) in paths {
+            let leaf_rev = &path[0].0;
+            if revs.iter().any(|(p, r)| *p == pos && r == leaf_rev) {
+                removed.push((pos, leaf_rev.clone()));
+            } else {
+                keep.push((pos, path));
+            }
+        }
+        if removed.is_empty() {
+            return removed;
+        }
+        let mut new_tree = RevTree(Vec::new());
+        for (pos, path) in keep {
+            let start = pos + 1 - path.len() as u64;
+            let mut node: Option<RevNode> = None;
+            for (key, val) in path {
+                node = Some(RevNode {
+                    key,
+                    val,
+                    children: node.into_iter().collect(),
+                });
+            }
+            if let Some(n) = node {
+                new_tree.merge_path(start, n);
+            }
+        }
+        self.0 = new_tree.0;
+        removed
+    }
+
+    /// Overwrite the stored seq of one leaf (purge gives the surviving winner
+    /// a fresh update_seq so the doc reappears on the changes feed).
+    pub fn set_leaf_seq(&mut self, pos: u64, revid: &[u8], seq: u64) {
+        fn walk(cur: u64, node: &mut RevNode, pos: u64, revid: &[u8], seq: u64) {
+            if cur == pos && node.key == revid {
+                if let RevVal::Leaf(l) = &mut node.val {
+                    l.seq = seq;
+                }
+                return;
+            }
+            for c in &mut node.children {
+                walk(cur + 1, c, pos, revid, seq);
+            }
+        }
+        for (start, root) in &mut self.0 {
+            walk(*start, root, pos, revid, seq);
+        }
+    }
+
     /// Every revision in the tree as (pos, revid) — couch_key_tree:get_all_leafs
     /// plus interior nodes; what _revs_diff checks membership against.
     pub fn all_revs(&self) -> Vec<(u64, &[u8])> {

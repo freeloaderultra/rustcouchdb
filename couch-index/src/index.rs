@@ -329,6 +329,52 @@ impl Index {
 }
 
 /// All indexes in a directory.
+impl Index {
+    /// Drop index entries for purged doc ids. Purges never appear on the
+    /// changes feed, so the incremental updater cannot learn about them —
+    /// the purge caller removes the entries directly instead.
+    pub fn purge_ids(&mut self, ids: &[Vec<u8>]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let id_keys: Vec<Term> = ids.iter().map(|id| Term::Bin(id.clone())).collect();
+        let old = btree::lookup(&self.file, &self.id_root, &id_keys)?;
+        let mut key_removes: Vec<Term> = Vec::new();
+        let mut id_removes: Vec<Term> = Vec::new();
+        for (id_key, old_val) in id_keys.into_iter().zip(old) {
+            if let Some(t) = old_val {
+                for k in t.as_list()? {
+                    key_removes.push(k.clone());
+                }
+                id_removes.push(id_key);
+            }
+        }
+        let n = id_removes.len();
+        if n == 0 {
+            return Ok(0);
+        }
+        self.key_root = btree::add_remove(
+            &mut self.file,
+            &self.key_root,
+            Reducer::Count,
+            vec![],
+            key_removes,
+        )?;
+        self.id_root = btree::add_remove(
+            &mut self.file,
+            &self.id_root,
+            Reducer::None,
+            vec![],
+            id_removes,
+        )?;
+        let header = self.header_term();
+        self.file.sync()?;
+        self.file.write_header(&header)?;
+        self.file.sync()?;
+        Ok(n)
+    }
+}
+
 pub fn list(dir: &Path) -> Result<Vec<Index>> {
     let mut out = Vec::new();
     let entries = match std::fs::read_dir(dir) {
