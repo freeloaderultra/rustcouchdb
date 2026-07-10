@@ -4,3 +4,5 @@ members = ["couch-mango", "couch-repl", "couch-store", "couch-index", "couch-htt
 
 [profile.release]
 lto = true
+codegen-units = 1
+strip = true

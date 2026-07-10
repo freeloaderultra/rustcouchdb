@@ -1,21 +1,46 @@
 # rustcouchdb — CouchDB-compatible server, pure Rust, no Erlang, no JavaScript.
 #
-#   docker build -t rustcouchdb .
+#   docker buildx build --platform linux/amd64,linux/arm64 -t rustcouchdb .
 #   docker run -p 5984:5984 -v rustcouchdb-data:/data \
 #     -e COUCH_HTTP_ADMIN=admin:password rustcouchdb
 #
 # The image contains two binaries: `couch-http` (the server: storage, Mango
 # queries, _replicator with native selector filtering, auto-compaction) and
 # `couch-repl` (standalone replicator CLI, also embedded in the server).
+#
+# The build stage always runs on the build host's native platform and
+# cross-compiles for $TARGETARCH, so multi-arch builds need no emulation
+# (ring is the only C dependency; the cross gcc covers it).
 
-FROM rust:1-slim AS build
+FROM --platform=$BUILDPLATFORM rust:1-slim AS build
+ARG TARGETARCH
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p couch-http -p couch-repl
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) target=x86_64-unknown-linux-gnu ;; \
+      arm64) target=aarch64-unknown-linux-gnu ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    if [ "$TARGETARCH" != "$(dpkg --print-architecture)" ]; then \
+      apt-get update; \
+      case "$TARGETARCH" in \
+        amd64) apt-get install -y --no-install-recommends gcc-x86-64-linux-gnu libc6-dev-amd64-cross; \
+               export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
+                      CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc ;; \
+        arm64) apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross; \
+               export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+                      CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc ;; \
+      esac; \
+      rm -rf /var/lib/apt/lists/*; \
+      rustup target add "$target"; \
+    fi; \
+    cargo build --release --target "$target" -p couch-http -p couch-repl; \
+    mkdir /out; \
+    cp "target/$target/release/couch-http" "target/$target/release/couch-repl" /out/
 
 FROM debian:bookworm-slim
-COPY --from=build /src/target/release/couch-http /usr/local/bin/couch-http
-COPY --from=build /src/target/release/couch-repl /usr/local/bin/couch-repl
+COPY --from=build /out/couch-http /out/couch-repl /usr/local/bin/
 RUN useradd -r -d /data rustcouchdb && mkdir -p /data && chown rustcouchdb /data
 USER rustcouchdb
 VOLUME /data
