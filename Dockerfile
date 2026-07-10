@@ -17,6 +17,7 @@ ARG TARGETARCH
 WORKDIR /src
 COPY . .
 RUN set -eux; \
+    gccbin=gcc; \
     case "$TARGETARCH" in \
       amd64) target=x86_64-unknown-linux-gnu ;; \
       arm64) target=aarch64-unknown-linux-gnu ;; \
@@ -26,9 +27,11 @@ RUN set -eux; \
       apt-get update; \
       case "$TARGETARCH" in \
         amd64) apt-get install -y --no-install-recommends gcc-x86-64-linux-gnu libc6-dev-amd64-cross; \
+               gccbin=x86_64-linux-gnu-gcc; \
                export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
                       CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc ;; \
         arm64) apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross; \
+               gccbin=aarch64-linux-gnu-gcc; \
                export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
                       CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc ;; \
       esac; \
@@ -37,11 +40,16 @@ RUN set -eux; \
     fi; \
     cargo build --release --target "$target" -p couch-http -p couch-repl; \
     mkdir /out; \
-    cp "target/$target/release/couch-http" "target/$target/release/couch-repl" /out/
+    cp "target/$target/release/couch-http" "target/$target/release/couch-repl" /out/; \
+    cp "$("$gccbin" -print-file-name=libgcc_s.so.1)" /out/
 
-FROM debian:bookworm-slim
+# busybox:glibc has glibc + NSS/DNS libs; the binaries additionally need
+# libgcc_s (unwinding), copied from the build sysroot. TLS roots are compiled
+# in (webpki-roots), so no ca-certificates package is required.
+FROM busybox:glibc
+COPY --from=build /out/libgcc_s.so.1 /lib/
 COPY --from=build /out/couch-http /out/couch-repl /usr/local/bin/
-RUN useradd -r -d /data rustcouchdb && mkdir -p /data && chown rustcouchdb /data
+RUN adduser -D -H -h /data rustcouchdb && mkdir -p /data && chown rustcouchdb /data
 USER rustcouchdb
 VOLUME /data
 EXPOSE 5984
