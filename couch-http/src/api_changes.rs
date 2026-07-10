@@ -212,15 +212,21 @@ async fn changes_inner(
             if !rows.is_empty() {
                 return Ok(normal_response(rows, last_seq, update_seq));
             }
-            // Wait for a write past `since`, then rescan once.
+            // Wait for a write past `since`, then rescan once. Check the
+            // current seq BEFORE waiting each round: a write that lands
+            // between the scan and the wait must not be lost until the next
+            // unrelated write.
             let mut seq_rx = dbh.seq_rx.clone();
             let deadline = tokio::time::sleep(Duration::from_millis(timeout));
             tokio::pin!(deadline);
             loop {
+                if *seq_rx.borrow_and_update() > since {
+                    break;
+                }
                 tokio::select! {
                     _ = &mut deadline => break,
                     r = seq_rx.changed() => {
-                        if r.is_err() || *seq_rx.borrow_and_update() > since {
+                        if r.is_err() {
                             break;
                         }
                     }
@@ -295,8 +301,12 @@ fn continuous(
             if remaining == 0 {
                 break;
             }
-            // Mark current value seen, then wait for the next write.
-            seq_rx.borrow_and_update();
+            // A write may have landed between the scan and now — rescan
+            // immediately instead of waiting (else the event is stuck until
+            // the next unrelated write).
+            if *seq_rx.borrow_and_update() > since {
+                continue;
+            }
             let hb = Duration::from_millis(heartbeat.unwrap_or(timeout));
             let wait_result = tokio::select! {
                 r = seq_rx.changed() => Some(r),
