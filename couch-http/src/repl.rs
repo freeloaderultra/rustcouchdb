@@ -101,9 +101,16 @@ impl Job {
         let mut t = self.stats_json();
         let o = t.as_object_mut().unwrap();
         o.insert("type".into(), json!("replication"));
-        o.insert("replication_id".into(), json!(format!("{}+{}", self.rep_id, if self.continuous { "continuous" } else { "normal" })));
-        o.insert("doc_id".into(), json!(self.doc_id));
-        o.insert("database".into(), json!("_replicator"));
+        // rep_id already carries the +continuous suffix when applicable.
+        o.insert("replication_id".into(), json!(self.rep_id));
+        if self.doc_id.is_empty() {
+            // Transient (POST /_replicate) jobs are not doc-backed.
+            o.insert("doc_id".into(), Value::Null);
+            o.insert("database".into(), Value::Null);
+        } else {
+            o.insert("doc_id".into(), json!(self.doc_id));
+            o.insert("database".into(), json!("_replicator"));
+        }
         o.insert("continuous".into(), json!(self.continuous));
         o.insert("source".into(), json!(self.source));
         o.insert("target".into(), json!(self.target));
@@ -123,6 +130,9 @@ impl Job {
 #[derive(Default)]
 pub struct ReplManager {
     pub jobs: Mutex<HashMap<String, Arc<Job>>>,
+    /// POST /_replicate jobs, keyed by rep_id. Not doc-backed: excluded from
+    /// _scheduler/docs and from _replicator reconciliation.
+    pub transient: Mutex<HashMap<String, Arc<Job>>>,
     notify: tokio::sync::Notify,
 }
 
@@ -135,6 +145,13 @@ impl ReplManager {
     pub fn snapshot_jobs(&self) -> Vec<Arc<Job>> {
         let mut v: Vec<Arc<Job>> = self.jobs.lock().unwrap().values().cloned().collect();
         v.sort_by(|a, b| a.doc_id.cmp(&b.doc_id));
+        v
+    }
+
+    /// Doc-backed and transient jobs together (_active_tasks, _scheduler/jobs).
+    pub fn snapshot_all(&self) -> Vec<Arc<Job>> {
+        let mut v = self.snapshot_jobs();
+        v.extend(self.transient.lock().unwrap().values().cloned());
         v
     }
 }
@@ -232,12 +249,121 @@ fn spec_sig(doc: &Value) -> String {
     let mut h = Md5::new();
     for field in [
         "source", "target", "continuous", "create_target", "selector", "doc_ids",
-        "winning_revs_only", "since_seq", "use_checkpoints", "filter",
+        "winning_revs_only", "since_seq", "use_checkpoints", "filter", "query_params",
     ] {
         h.update(field.as_bytes());
         h.update(doc.get(field).map(|v| v.to_string()).unwrap_or_default());
     }
     crate::state::hex(&h.finalize())
+}
+
+/// Everything needed to run one replication, derived from a _replicator doc
+/// or a POST /_replicate body.
+pub struct Spec {
+    pub source_url: String,
+    pub target_url: String,
+    pub rep_id: String,
+    pub continuous: bool,
+    pub opts: RepOptions,
+}
+
+/// Resolve endpoints, translate any `filter` to a native selector, and build
+/// the couch-repl options. Fetches the filter design doc from the source, so
+/// it can fail like the Erlang replicator does when the ddoc is missing.
+pub async fn build_spec(app: &App, doc: &Value) -> Result<Spec, String> {
+    let source_url = match doc.get("source").map(|s| resolve_endpoint_url(app, s)) {
+        Some(Ok(u)) => u,
+        Some(Err(e)) => return Err(e),
+        None => return Err("missing source".into()),
+    };
+    let target_url = match doc.get("target").map(|t| resolve_endpoint_url(app, t)) {
+        Some(Ok(u)) => u,
+        Some(Err(e)) => return Err(e),
+        None => return Err("missing target".into()),
+    };
+    let continuous = doc.get("continuous").and_then(|c| c.as_bool()).unwrap_or(false);
+    let winning_revs_only = doc
+        .get("winning_revs_only")
+        .and_then(|c| c.as_bool())
+        .unwrap_or(false);
+    let create_target = doc.get("create_target").and_then(|c| c.as_bool()).unwrap_or(false);
+
+    let retry = RetryPolicy::default();
+    let mk = |label: &'static str, url: &str| Endpoint::new(label, url, &[], false, 60, retry);
+    let (source, _target) = match (mk("source", &source_url), mk("target", &target_url)) {
+        (Ok(s), Ok(t)) => (s, t),
+        (Err(e), _) | (_, Err(e)) => return Err(e.to_string()),
+    };
+
+    let mut filter = Filter {
+        doc_ids: doc.get("doc_ids").and_then(|d| d.as_array()).map(|a| {
+            a.iter().filter_map(|v| v.as_str().map(String::from)).collect()
+        }),
+        selector: doc.get("selector").cloned().filter(|s| !s.is_null()),
+    };
+    if let Some(f) = doc.get("filter").and_then(|f| f.as_str()) {
+        if filter.selector.is_some() {
+            return Err("`filter` and `selector` cannot be combined".into());
+        }
+        let (ddoc, name) = f
+            .split_once('/')
+            .ok_or_else(|| format!("invalid filter {f:?}; expected \"ddoc/filtername\""))?;
+        let dd: Value = source
+            .get_json(&["_design", ddoc], &[])
+            .await
+            .map_err(|e| format!("cannot fetch filter design doc _design/{ddoc}: {e}"))?;
+        let src = dd
+            .get("filters")
+            .and_then(|fs| fs.get(name))
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| format!("design doc _design/{ddoc} has no filter {name:?}"))?;
+        let qp = match doc.get("query_params") {
+            None | Some(Value::Null) => Map::new(),
+            Some(Value::Object(m)) => m.clone(),
+            Some(_) => return Err("query_params must be an object".into()),
+        };
+        let sel = crate::jsfilter::js_filter_to_selector(src, &qp).map_err(|e| {
+            format!("filter {f:?} is not translatable to a native selector: {e}")
+        })?;
+        filter.selector = Some(sel);
+    }
+
+    let since = doc.get("since_seq").map(|s| match s {
+        Value::String(x) => x.clone(),
+        other => other.to_string(),
+    });
+
+    let rep_id = ids::replication_id(
+        &source.normalized_url(),
+        &_target.normalized_url(),
+        &filter,
+        continuous,
+        winning_revs_only,
+    );
+    let opts = RepOptions {
+        continuous,
+        winning_revs_only,
+        create_target,
+        since,
+        filter,
+        fetch_concurrency: 32,
+        write_concurrency: 8,
+        att_concurrency: 16,
+        batch_size: 500,
+        max_batch_bytes: 4 * 1024 * 1024,
+        inline_att_threshold: 65536,
+        checkpoint_interval: Duration::from_millis(30000),
+        use_checkpoints: doc
+            .get("use_checkpoints")
+            .and_then(|c| c.as_bool())
+            .unwrap_or(true),
+        use_bulk_get: true,
+        continue_on_error: false,
+        changes_limit: 10000,
+        stats_interval: Duration::from_secs(5),
+        progress: false,
+    };
+    Ok(Spec { source_url, target_url, rep_id, continuous, opts })
 }
 
 fn resolve_endpoint_url(app: &App, v: &Value) -> Result<String, String> {
@@ -291,88 +417,18 @@ async fn start_job(app: App, doc_id: String, spec_sig: String, doc: Value) {
         .await;
     };
 
-    let source_url = match doc.get("source").map(|s| resolve_endpoint_url(&app, s)) {
-        Some(Ok(u)) => u,
-        Some(Err(e)) => return fail_doc(app, doc_id, e).await,
-        None => return fail_doc(app, doc_id, "missing source".into()).await,
-    };
-    let target_url = match doc.get("target").map(|t| resolve_endpoint_url(&app, t)) {
-        Some(Ok(u)) => u,
-        Some(Err(e)) => return fail_doc(app, doc_id, e).await,
-        None => return fail_doc(app, doc_id, "missing target".into()).await,
-    };
-    let continuous = doc.get("continuous").and_then(|c| c.as_bool()).unwrap_or(false);
-    let winning_revs_only = doc
-        .get("winning_revs_only")
-        .and_then(|c| c.as_bool())
-        .unwrap_or(false);
-    let create_target = doc.get("create_target").and_then(|c| c.as_bool()).unwrap_or(false);
-    let filter = Filter {
-        doc_ids: doc.get("doc_ids").and_then(|d| d.as_array()).map(|a| {
-            a.iter().filter_map(|v| v.as_str().map(String::from)).collect()
-        }),
-        selector: doc.get("selector").cloned().filter(|s| !s.is_null()),
-    };
-    if doc.get("filter").is_some() {
-        return fail_doc(
-            app,
-            doc_id,
-            "JavaScript filters are not supported; use a selector".into(),
-        )
-        .await;
-    }
-    let since = doc
-        .get("since_seq")
-        .map(|s| match s {
-            Value::String(x) => x.clone(),
-            other => other.to_string(),
-        });
-
-    let retry = RetryPolicy::default();
-    let mk = |label: &'static str, url: &str| Endpoint::new(label, url, &[], false, 60, retry);
-    let (source, target) = match (mk("source", &source_url), mk("target", &target_url)) {
-        (Ok(s), Ok(t)) => (s, t),
-        (Err(e), _) | (_, Err(e)) => return fail_doc(app, doc_id, e.to_string()).await,
-    };
-
-    let rep_id = ids::replication_id(
-        &source.normalized_url(),
-        &target.normalized_url(),
-        &filter,
-        continuous,
-        winning_revs_only,
-    );
-    let opts = RepOptions {
-        continuous,
-        winning_revs_only,
-        create_target,
-        since,
-        filter,
-        fetch_concurrency: 32,
-        write_concurrency: 8,
-        att_concurrency: 16,
-        batch_size: 500,
-        max_batch_bytes: 4 * 1024 * 1024,
-        inline_att_threshold: 65536,
-        checkpoint_interval: Duration::from_millis(30000),
-        use_checkpoints: doc
-            .get("use_checkpoints")
-            .and_then(|c| c.as_bool())
-            .unwrap_or(true),
-        use_bulk_get: true,
-        continue_on_error: false,
-        changes_limit: 10000,
-        stats_interval: Duration::from_secs(5),
-        progress: false,
+    let spec = match build_spec(&app, &doc).await {
+        Ok(s) => s,
+        Err(e) => return fail_doc(app, doc_id, e).await,
     };
 
     let job = Arc::new(Job {
         doc_id: doc_id.clone(),
         spec_sig,
-        rep_id: rep_id.clone(),
-        source: strip_creds(&source_url),
-        target: strip_creds(&target_url),
-        continuous,
+        rep_id: spec.rep_id.clone(),
+        source: strip_creds(&spec.source_url),
+        target: strip_creds(&spec.target_url),
+        continuous: spec.continuous,
         stats: Arc::new(Stats::default()),
         phase: Mutex::new(Phase::Running),
         error_count: AtomicU32::new(0),
@@ -387,9 +443,95 @@ async fn start_job(app: App, doc_id: String, spec_sig: String, doc: Value) {
     info!("replication job {doc_id} started ({} -> {})", job.source, job.target);
 
     // Stamp the replication id (like the Erlang manager).
-    write_doc_fields(&app, &doc_id, json!({"_replication_id": rep_id})).await;
+    write_doc_fields(&app, &doc_id, json!({"_replication_id": spec.rep_id})).await;
 
-    tokio::spawn(supervise(app, job, source_url, target_url, opts));
+    tokio::spawn(supervise(app, job, spec.source_url, spec.target_url, spec.opts));
+}
+
+/// Start a POST /_replicate job. Continuous jobs run supervised in the
+/// background; one-shot jobs run to completion before this returns (like
+/// CouchDB, whose /_replicate blocks for normal replications).
+pub async fn start_transient(app: App, doc: Value) -> Result<Value, String> {
+    let spec = build_spec(&app, &doc).await?;
+    let job = Arc::new(Job {
+        doc_id: String::new(),
+        spec_sig: String::new(),
+        rep_id: spec.rep_id.clone(),
+        source: strip_creds(&spec.source_url),
+        target: strip_creds(&spec.target_url),
+        continuous: spec.continuous,
+        stats: Arc::new(Stats::default()),
+        phase: Mutex::new(Phase::Running),
+        error_count: AtomicU32::new(0),
+        started: now_secs(),
+        cancel: CancellationToken::new(),
+    });
+    // Same spec posted again: replace (cancel) the previous instance.
+    if let Some(old) = app
+        .repl
+        .transient
+        .lock()
+        .unwrap()
+        .insert(spec.rep_id.clone(), job.clone())
+    {
+        old.cancel.cancel();
+    }
+    info!(
+        "transient replication {} started ({} -> {})",
+        spec.rep_id, job.source, job.target
+    );
+
+    if spec.continuous {
+        tokio::spawn(supervise(
+            app,
+            job.clone(),
+            spec.source_url,
+            spec.target_url,
+            spec.opts,
+        ));
+        return Ok(json!({"ok": true, "_local_id": spec.rep_id}));
+    }
+
+    let retry = RetryPolicy::default();
+    let run = async {
+        let source = Endpoint::new("source", &spec.source_url, &[], false, 60, retry)?;
+        let target = Endpoint::new("target", &spec.target_url, &[], false, 60, retry)?;
+        pipeline::replicate(source, target, spec.opts.clone(), job.stats.clone(), job.cancel.clone()).await
+    };
+    let result = run.await;
+    app.repl.transient.lock().unwrap().remove(&spec.rep_id);
+    match result {
+        Ok(_) => Ok(json!({
+            "ok": true,
+            "replication_id_version": 4,
+            "history": [job.info_json()],
+        })),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Cancel a transient replication: by explicit `replication_id`/`_local_id`,
+/// or by re-deriving the id from the posted spec.
+pub async fn cancel_transient(app: &App, doc: &Value) -> Result<Option<Value>, String> {
+    let explicit = doc
+        .get("replication_id")
+        .or_else(|| doc.get("_local_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let rep_id = match explicit {
+        Some(id) => id,
+        None => build_spec(app, doc).await?.rep_id,
+    };
+    let mut transient = app.repl.transient.lock().unwrap();
+    // rep_id carries "+continuous" for continuous jobs; accept it bare too.
+    let key = [rep_id.clone(), format!("{rep_id}+continuous")]
+        .into_iter()
+        .find(|k| transient.contains_key(k));
+    Ok(key.map(|k| {
+        let j = transient.remove(&k).unwrap();
+        j.cancel.cancel();
+        json!({"ok": true, "_local_id": k})
+    }))
 }
 
 async fn supervise(app: App, job: Arc<Job>, source_url: String, target_url: String, opts: RepOptions) {
@@ -415,6 +557,10 @@ async fn supervise(app: App, job: Arc<Job>, source_url: String, target_url: Stri
                 } else {
                     *job.phase.lock().unwrap() = Phase::Completed;
                     let s = job.stats_json();
+                    if job.doc_id.is_empty() {
+                        app.repl.transient.lock().unwrap().remove(&job.rep_id);
+                        return;
+                    }
                     write_doc_fields(
                         &app,
                         &job.doc_id,
@@ -438,6 +584,11 @@ async fn supervise(app: App, job: Arc<Job>, source_url: String, target_url: Stri
                 let permanent = matches!(e, couch_repl::error::Error::Url(_));
                 if permanent || attempt > 8 {
                     *job.phase.lock().unwrap() = Phase::Failed(e.to_string());
+                    if job.doc_id.is_empty() {
+                        app.repl.transient.lock().unwrap().remove(&job.rep_id);
+                        error!("transient replication {} failed permanently: {e}", job.rep_id);
+                        return;
+                    }
                     write_doc_fields(
                         &app,
                         &job.doc_id,

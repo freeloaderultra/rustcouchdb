@@ -7,9 +7,11 @@ pub mod api_changes;
 pub mod api_db;
 pub mod api_docs;
 pub mod api_mango;
+pub mod api_repl;
 pub mod api_root;
 pub mod auth;
 pub mod error;
+pub mod jsfilter;
 pub mod repl;
 pub mod state;
 pub mod util;
@@ -54,6 +56,7 @@ pub fn router(app: App) -> Router {
         .route("/_all_dbs", get(api_root::all_dbs))
         .route("/_uuids", get(api_root::uuids))
         .route("/_active_tasks", get(api_root::active_tasks))
+        .route("/_replicate", post(api_repl::replicate))
         .route("/_scheduler/jobs", get(api_root::scheduler_jobs))
         .route("/_scheduler/docs", get(api_root::scheduler_docs))
         .route("/_scheduler/docs/_replicator", get(api_root::scheduler_docs))

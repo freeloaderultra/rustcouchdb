@@ -39,7 +39,7 @@ pub async fn uuids(State(state): State<App>, Query(q): Query<Q>) -> Json<Value> 
 pub async fn active_tasks(State(state): State<App>) -> Json<Value> {
     let mut tasks: Vec<Value> = state
         .repl
-        .snapshot_jobs()
+        .snapshot_all()
         .iter()
         .filter_map(|j| j.active_task())
         .collect();
@@ -118,14 +118,14 @@ pub async fn scheduler_doc(
 pub async fn scheduler_jobs(State(state): State<App>) -> ApiResult<Response> {
     let jobs: Vec<Value> = state
         .repl
-        .snapshot_jobs()
+        .snapshot_all()
         .iter()
         .filter(|j| !matches!(j.scheduler_state(), "completed" | "failed"))
         .map(|j| {
             json!({
-                "id": format!("{}+{}", j.rep_id, if j.continuous { "continuous" } else { "normal" }),
-                "database": "_replicator",
-                "doc_id": j.doc_id,
+                "id": j.rep_id,
+                "database": if j.doc_id.is_empty() { Value::Null } else { json!("_replicator") },
+                "doc_id": if j.doc_id.is_empty() { Value::Null } else { json!(j.doc_id.clone()) },
                 "node": "nonode@nohost",
                 "pid": "<0.0.0>",
                 "source": j.source,
