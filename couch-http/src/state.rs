@@ -252,9 +252,10 @@ impl ServerState {
 }
 
 /// CouchDB db-name rule, minus `/` (no sharding here) but allowing the
-/// leading-underscore system names we host (_replicator, _users).
+/// leading-underscore system names CouchDB accepts (_replicator, _users,
+/// _global_changes).
 pub fn valid_db_name(name: &str) -> bool {
-    if name == "_replicator" || name == "_users" {
+    if name == "_replicator" || name == "_users" || name == "_global_changes" {
         return true;
     }
     let mut chars = name.chars();
