@@ -14,6 +14,14 @@
 
 FROM --platform=$BUILDPLATFORM rust:1-slim AS build
 ARG TARGETARCH
+# Release builds default to max optimization (fat LTO, one codegen unit).
+# For fast development iteration pass e.g.
+#   --build-arg CARGO_PROFILE_RELEASE_LTO=false \
+#   --build-arg CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+ARG CARGO_PROFILE_RELEASE_LTO=true
+ARG CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+ENV CARGO_PROFILE_RELEASE_LTO=$CARGO_PROFILE_RELEASE_LTO \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=$CARGO_PROFILE_RELEASE_CODEGEN_UNITS
 WORKDIR /src
 COPY . .
 RUN set -eux; \

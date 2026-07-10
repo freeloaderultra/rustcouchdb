@@ -40,8 +40,11 @@ pub struct CheckpointDoc {
     pub source_last_seq: serde_json::Value,
     #[serde(default)]
     pub replicator: String,
+    /// CouchDB writes the integer 4 here and consumers (nxguide's checkpoint
+    /// reader among them) decode it as a number — the distinct "couch-repl"
+    /// `replicator` field carries our provenance instead.
     #[serde(default)]
-    pub replication_id_version: String,
+    pub replication_id_version: u32,
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
 }
@@ -191,7 +194,7 @@ impl Checkpointer {
             session_id: self.session_id.clone(),
             source_last_seq: serde_json::Value::String(seq.clone()),
             replicator: "couch-repl".into(),
-            replication_id_version: "rust-1".into(),
+            replication_id_version: 4,
             history: history.clone(),
         };
 
@@ -290,7 +293,7 @@ mod tests {
             session_id: session.into(),
             source_last_seq: serde_json::Value::String(seq.into()),
             replicator: "couch-repl".into(),
-            replication_id_version: "rust-1".into(),
+            replication_id_version: 4,
             history: history
                 .into_iter()
                 .map(|(s, q)| HistoryEntry {
