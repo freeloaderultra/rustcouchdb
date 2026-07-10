@@ -400,6 +400,19 @@ fn type_of(v: &Value) -> &'static str {
     }
 }
 
+/// couch_ejson_compare ordering, public for consumers that need to sort
+/// EJSON values the way CouchDB does (e.g. index keys in couch-index).
+pub fn collate(a: &Value, b: &Value) -> Ordering {
+    cmp(a, b, false)
+}
+
+/// Extract a dotted-path field from a document (mango_doc:get_field) —
+/// public so couch-index can build index keys with identical semantics.
+pub fn get_field<'a>(doc: &'a Value, field: &str) -> Option<&'a Value> {
+    let path = parse_field(field).ok()?;
+    get_path(doc, &path)
+}
+
 /// couch_ejson_compare ordering: null < false < true < number < string <
 /// array < object. Numbers compare numerically across int/float. Strings
 /// compare by codepoint (the server uses ICU collation; see module docs).

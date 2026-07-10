@@ -1,0 +1,10 @@
+[package]
+name = "couch-mango"
+version = "0.1.0"
+edition = "2021"
+description = "CouchDB Mango selector engine and EJSON collation — Rust port of mango_selector/couch_ejson_compare"
+license = "Apache-2.0"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+regex = "1"

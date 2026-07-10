@@ -18,6 +18,9 @@ use tracing::{error, info, warn};
 
 pub struct RepOptions {
     pub continuous: bool,
+    /// Replicate only winning revisions (CouchDB's winning_revs_only;
+    /// changes feed uses style=main_only).
+    pub winning_revs_only: bool,
     pub create_target: bool,
     pub since: Option<String>,
     pub filter: Filter,
@@ -65,6 +68,7 @@ pub async fn replicate(
         &target.normalized_url(),
         &opts.filter,
         opts.continuous,
+        opts.winning_revs_only,
     );
     info!("replication id: {rep_id}");
 
@@ -77,7 +81,7 @@ pub async fn replicate(
         .selector
         .as_ref()
         .map(|s| {
-            crate::mango::Selector::compile(s)
+            couch_mango::Selector::compile(s)
                 .map_err(|e| Error::Protocol(format!("invalid selector: {e}")))
         })
         .transpose()?;
@@ -118,6 +122,7 @@ pub async fn replicate(
         stats: stats.clone(),
         cancel: cancel.clone(),
         page_size: opts.changes_limit,
+        winning_revs_only: opts.winning_revs_only,
     };
     let continuous = opts.continuous;
     let reader_start = start_seq.clone();

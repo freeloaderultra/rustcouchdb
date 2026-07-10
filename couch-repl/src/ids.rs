@@ -17,6 +17,7 @@ pub fn replication_id(
     target_url: &str,
     filter: &Filter,
     continuous: bool,
+    winning_revs_only: bool,
 ) -> String {
     let doc_ids = filter.doc_ids.as_ref().map(|ids| {
         let mut sorted = ids.clone();
@@ -30,6 +31,7 @@ pub fn replication_id(
         "target": target_url,
         "doc_ids": doc_ids,
         "selector": filter.selector,
+        "winning_revs_only": winning_revs_only,
     });
     let mut hasher = Md5::new();
     hasher.update(canonical.to_string().as_bytes());
@@ -56,12 +58,12 @@ mod tests {
     #[test]
     fn stable_and_sensitive() {
         let f = Filter::default();
-        let a = replication_id("http://h/db1", "http://h/db2", &f, false);
-        let b = replication_id("http://h/db1", "http://h/db2", &f, false);
+        let a = replication_id("http://h/db1", "http://h/db2", &f, false, false);
+        let b = replication_id("http://h/db1", "http://h/db2", &f, false, false);
         assert_eq!(a, b);
-        let c = replication_id("http://h/db1", "http://h/db3", &f, false);
+        let c = replication_id("http://h/db1", "http://h/db3", &f, false, false);
         assert_ne!(a, c);
-        let d = replication_id("http://h/db1", "http://h/db2", &f, true);
+        let d = replication_id("http://h/db1", "http://h/db2", &f, true, false);
         assert_eq!(d, format!("{a}+continuous"));
     }
 
@@ -76,8 +78,8 @@ mod tests {
             selector: None,
         };
         assert_eq!(
-            replication_id("http://h/x", "http://h/y", &f1, false),
-            replication_id("http://h/x", "http://h/y", &f2, false)
+            replication_id("http://h/x", "http://h/y", &f1, false, false),
+            replication_id("http://h/x", "http://h/y", &f2, false, false)
         );
     }
 }

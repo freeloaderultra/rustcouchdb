@@ -7,7 +7,6 @@ mod error;
 mod fetch;
 mod gen;
 mod ids;
-mod mango;
 mod pipeline;
 mod retry;
 mod revs_diff;
@@ -94,7 +93,7 @@ fn print_id(args: cli::IdArgs) -> i32 {
     };
     match (mk("source", &args.source), mk("target", &args.target)) {
         (Ok(s), Ok(t)) => {
-            let id = ids::replication_id(&s, &t, &filter, args.continuous);
+            let id = ids::replication_id(&s, &t, &filter, args.continuous, args.winning_revs_only);
             println!("replication id:  {id}");
             println!("checkpoint doc:  {}", ids::checkpoint_doc_id(&id));
             0
@@ -133,6 +132,7 @@ async fn replicate(args: cli::ReplicateArgs) -> i32 {
         let filter = parse_filter(args.doc_ids.clone(), args.selector.clone())?;
         let opts = pipeline::RepOptions {
             continuous: args.continuous,
+            winning_revs_only: args.winning_revs_only,
             create_target: args.create_target,
             since: args.since.clone(),
             filter,

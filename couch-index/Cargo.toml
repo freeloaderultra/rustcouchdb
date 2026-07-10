@@ -1,0 +1,13 @@
+[package]
+name = "couch-index"
+version = "0.1.0"
+edition = "2021"
+description = "Native Mango JSON indexes for CouchDB databases — built on couch-store btrees, no couchjs"
+license = "Apache-2.0"
+
+[dependencies]
+couch-store = { path = "../couch-store" }
+couch-mango = { path = "../couch-mango" }
+clap = { version = "4", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+md-5 = "0.10"

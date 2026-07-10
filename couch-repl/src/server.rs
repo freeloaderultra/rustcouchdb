@@ -28,6 +28,8 @@ pub struct JobSpec {
     #[serde(default)]
     pub continuous: bool,
     #[serde(default)]
+    pub winning_revs_only: bool,
+    #[serde(default)]
     pub create_target: bool,
     #[serde(default)]
     pub since: Option<String>,
@@ -104,6 +106,7 @@ impl JobSpec {
     fn options(&self) -> RepOptions {
         RepOptions {
             continuous: self.continuous,
+            winning_revs_only: self.winning_revs_only,
             create_target: self.create_target,
             since: self.since.clone(),
             filter: Filter {
@@ -190,6 +193,7 @@ impl ServerState {
             &target.normalized_url(),
             &filter,
             spec.continuous,
+            spec.winning_revs_only,
         );
         let name = spec
             .name

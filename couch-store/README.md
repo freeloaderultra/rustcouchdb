@@ -45,6 +45,7 @@ couch-store local   db.couch                  # _local docs (checkpoints!)
 couch-store att     db.couch DOCID NAME > file
 couch-store security db.couch
 couch-store verify  db.couch                  # walk + checksum everything
+couch-store compact db.couch                  # rewrite live data, atomic swap
 couch-store create  new.couch --from docs.ndjson   # build a shard from JSON
 couch-store append  db.couch  --from more.ndjson   # merge more docs in
 ```
@@ -87,15 +88,16 @@ merge across shards — trivial since each file's id tree is already sorted).
 
 Same file format, no server between you and the disk.
 
+The compactor (`compact.rs`) preserves uuid/epochs/security/props/time_seq,
+sets compacted_seq, and swaps atomically; CouchDB reads (and keeps writing
+into) the result — server-verified. Native Mango indexes on this engine
+live in [couch-index](../couch-index).
+
 ## Not yet
 
 - zstd `file_compression` (CouchDB writes snappy by default; snappy/deflate/
   none all supported).
 - Purge trees are read (purge_seq) but not written.
-- No compactor — rewrite via `dump | create`, or let CouchDB compact.
-- Views/indexes: `.view` files use the same couch_file/couch_btree layer
-  this crate implements; a native Mango index on top of it is the natural
-  next module (couch-repl already has the selector engine).
 
 ## Build
 

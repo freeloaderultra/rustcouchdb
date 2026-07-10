@@ -1,16 +1,5 @@
-mod btree;
-mod compress;
-mod db;
-mod doc;
-mod ejson;
-mod error;
-mod etf;
-mod file;
-mod header;
-mod revtree;
-mod writer;
-
 use clap::{Parser, Subcommand};
+use couch_store::{compact, db, doc, ejson, error, revtree, writer};
 use db::{Db, DocOpts};
 use error::Result;
 use revtree::RevVal;
@@ -80,6 +69,8 @@ enum Cmd {
     },
     /// Read every doc, revision, summary and attachment; verify checksums
     Verify { file: String },
+    /// Compact: rewrite the file keeping only live data (atomic swap)
+    Compact { file: String },
     /// Create a new .couch file from NDJSON docs (one JSON doc per line;
     /// honors _rev/_revisions/_deleted/_attachments-with-data)
     Create {
@@ -222,6 +213,9 @@ fn run(cmd: Cmd) -> Result<()> {
         Cmd::Verify { file } => {
             let db = Db::open(&file)?;
             verify(&db)?;
+        }
+        Cmd::Compact { file } => {
+            println_json(&compact::compact(&file)?);
         }
         Cmd::Create { file, from, batch } => {
             let w = writer::DbWriter::create(&file)?;

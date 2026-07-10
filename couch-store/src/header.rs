@@ -92,6 +92,11 @@ impl DbHeader {
             h.purge_tree_state = Term::nil();
             h.purge_seq_tree_state = Term::nil();
         }
+        // upgrade_time_seq: this slot used to be an always-0 unused field,
+        // so 0 means "no time_seq data", not a pointer to offset 0.
+        if h.time_seq_ptr == Term::Int(0) {
+            h.time_seq_ptr = Term::atom("undefined");
+        }
         Ok(h)
     }
 

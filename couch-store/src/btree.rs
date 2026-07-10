@@ -181,6 +181,63 @@ where
     Ok(ControlFlow::Continue(()))
 }
 
+/// Reverse in-order fold: keys stream in descending order, starting from
+/// `start_key` (inclusive upper bound) or the greatest key.
+pub fn fold_rev<F>(
+    file: &CouchFile,
+    root: &Option<TreeState>,
+    start_key: Option<&Term>,
+    f: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&Term, &Term) -> Result<ControlFlow<()>>,
+{
+    let Some(root) = root else { return Ok(()) };
+    let _ = fold_rev_node(file, root.ptr, start_key, f)?;
+    Ok(())
+}
+
+fn fold_rev_node<F>(
+    file: &CouchFile,
+    ptr: u64,
+    start_key: Option<&Term>,
+    f: &mut F,
+) -> Result<ControlFlow<()>>
+where
+    F: FnMut(&Term, &Term) -> Result<ControlFlow<()>>,
+{
+    let (is_kp, kvs) = get_node(file, ptr)?;
+    if is_kp {
+        // The first entry with key >= start bounds the start subtree; every
+        // entry after it holds only greater keys.
+        let last = match start_key {
+            None => kvs.len(),
+            Some(sk) => kvs
+                .iter()
+                .position(|(k, _)| etf::cmp(k, sk) != Ordering::Less)
+                .map(|i| i + 1)
+                .unwrap_or(kvs.len()),
+        };
+        for (_key, pi) in kvs[..last].iter().rev() {
+            if fold_rev_node(file, ptr_of(pi)?, start_key, f)?.is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+    } else {
+        for (key, val) in kvs.iter().rev() {
+            if let Some(sk) = start_key {
+                if etf::cmp(key, sk) == Ordering::Greater {
+                    continue;
+                }
+            }
+            if f(key, val)?.is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+        }
+    }
+    Ok(ControlFlow::Continue(()))
+}
+
 /// Point lookups. Returns results in input order.
 pub fn lookup(
     file: &CouchFile,

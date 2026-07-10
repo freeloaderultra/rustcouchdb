@@ -14,5 +14,3 @@ md-5 = "0.10"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 base64 = "0.22"
 
-[profile.release]
-lto = true

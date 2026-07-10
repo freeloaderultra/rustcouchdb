@@ -57,6 +57,10 @@ pub struct ReplicateArgs {
     /// natively in couch-repl (never on the server, never through JS)
     #[arg(long)]
     pub selector: Option<String>,
+    /// Replicate only each doc's winning revision, skipping conflict
+    /// branches (CouchDB's winning_revs_only)
+    #[arg(long)]
+    pub winning_revs_only: bool,
 
     /// Concurrent _bulk_get requests in flight
     #[arg(long, default_value_t = 32)]
@@ -124,6 +128,8 @@ pub struct IdArgs {
     pub doc_ids: Option<Vec<String>>,
     #[arg(long)]
     pub selector: Option<String>,
+    #[arg(long)]
+    pub winning_revs_only: bool,
 }
 
 #[derive(Args)]

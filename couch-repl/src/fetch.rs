@@ -56,7 +56,7 @@ pub struct Fetcher {
     /// non-matching revisions complete their ledger unit and are dropped.
     /// Filtering here (after the parallel _bulk_get) keeps the changes feed
     /// lean and spreads body reads over all fetch connections.
-    pub selector: Option<crate::mango::Selector>,
+    pub selector: Option<couch_mango::Selector>,
 }
 
 impl Fetcher {

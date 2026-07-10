@@ -37,6 +37,9 @@ couch-repl replicate $SRC $TGT --continuous
 couch-repl replicate $SRC $TGT --doc-ids a,b,c
 couch-repl replicate $SRC $TGT --selector '{"type":"order"}'
 
+# replicate only winning revisions, skipping conflict branches
+couch-repl replicate $SRC $TGT --winning-revs-only
+
 # where is my checkpoint?
 couch-repl id $SRC $TGT
 
@@ -69,6 +72,7 @@ HTTP API. Jobs can be declared in a JSON config file and/or managed at runtime:
 | `DELETE /_jobs/{name}` | cancel a job (drains in-flight work, writes a final checkpoint) |
 
 Job fields beyond the four above: `since`, `doc_ids`, `selector`,
+`winning_revs_only`,
 `fetch_concurrency`, `write_concurrency`, `att_concurrency`, `batch_size`,
 `max_batch_bytes`, `inline_att_threshold`, `checkpoint_interval_ms`,
 `no_checkpoints`, `no_bulk_get`, `timeout_secs`, `max_retries`,

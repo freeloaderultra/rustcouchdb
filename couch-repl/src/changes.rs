@@ -53,12 +53,16 @@ pub struct ChangesReader {
     pub stats: Arc<Stats>,
     pub cancel: CancellationToken,
     pub page_size: usize,
+    /// CouchDB's winning_revs_only: replicate only each doc's winning
+    /// branch (style=main_only) instead of all leaf revisions.
+    pub winning_revs_only: bool,
 }
 
 impl ChangesReader {
     fn base_query(&self, since: &str) -> Vec<(&'static str, String)> {
+        let style = if self.winning_revs_only { "main_only" } else { "all_docs" };
         let mut q = vec![
-            ("style", "all_docs".to_string()),
+            ("style", style.to_string()),
             ("since", since.to_string()),
         ];
         // Selectors are evaluated natively in couch-repl (in the fetch
