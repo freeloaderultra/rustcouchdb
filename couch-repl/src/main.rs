@@ -76,8 +76,8 @@ fn print_id(args: cli::IdArgs) -> i32 {
     };
     match (mk("source", &args.source), mk("target", &args.target)) {
         (Ok(s), Ok(t)) => {
-            let id = ids::replication_id(&s, &t, &filter, args.continuous, args.winning_revs_only);
-            println!("replication id:  {id}");
+            let id = ids::replication_id(&s, &t, &filter, args.winning_revs_only);
+            println!("replication id:  {}", ids::task_id(&id, args.continuous));
             println!("checkpoint doc:  {}", ids::checkpoint_doc_id(&id));
             0
         }

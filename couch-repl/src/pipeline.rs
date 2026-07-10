@@ -68,10 +68,9 @@ pub async fn replicate(
         &source.normalized_url(),
         &target.normalized_url(),
         &opts.filter,
-        opts.continuous,
         opts.winning_revs_only,
     );
-    info!("replication id: {rep_id}");
+    info!("replication id: {}", crate::ids::task_id(&rep_id, opts.continuous));
 
     // Selector filtering always runs natively in couch-repl, applied to each
     // fetched leaf revision after the parallel _bulk_get: the source never

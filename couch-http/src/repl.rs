@@ -43,6 +43,13 @@ impl Job {
         matches!(*self.phase.lock().unwrap(), Phase::Completed | Phase::Failed(_))
     }
 
+    /// Displayed id: base rep_id plus option suffixes (CouchDB BaseId ++ ExtId).
+    /// Consumers (nxguide's checkpoint fetcher) truncate this at the first '+'
+    /// to find the `_local/<BaseId>` checkpoint doc.
+    pub fn task_id(&self) -> String {
+        ids::task_id(&self.rep_id, self.continuous)
+    }
+
     pub fn scheduler_state(&self) -> &'static str {
         match &*self.phase.lock().unwrap() {
             Phase::Running => "running",
@@ -82,7 +89,7 @@ impl Job {
         json!({
             "database": "_replicator",
             "doc_id": self.doc_id,
-            "id": self.rep_id,
+            "id": self.task_id(),
             "node": "nonode@nohost",
             "source": self.source,
             "target": self.target,
@@ -101,8 +108,7 @@ impl Job {
         let mut t = self.stats_json();
         let o = t.as_object_mut().unwrap();
         o.insert("type".into(), json!("replication"));
-        // rep_id already carries the +continuous suffix when applicable.
-        o.insert("replication_id".into(), json!(self.rep_id));
+        o.insert("replication_id".into(), json!(self.task_id()));
         if self.doc_id.is_empty() {
             // Transient (POST /_replicate) jobs are not doc-backed.
             o.insert("doc_id".into(), Value::Null);
@@ -337,7 +343,6 @@ pub async fn build_spec(app: &App, doc: &Value) -> Result<Spec, String> {
         &source.normalized_url(),
         &_target.normalized_url(),
         &filter,
-        continuous,
         winning_revs_only,
     );
     let opts = RepOptions {
@@ -352,7 +357,10 @@ pub async fn build_spec(app: &App, doc: &Value) -> Result<Spec, String> {
         batch_size: 500,
         max_batch_bytes: 4 * 1024 * 1024,
         inline_att_threshold: 65536,
-        checkpoint_interval: Duration::from_millis(30000),
+        // nxguide's replication docs set this to 10s; CouchDB's default is 30s.
+        checkpoint_interval: Duration::from_millis(
+            doc.get("checkpoint_interval").and_then(|v| v.as_u64()).unwrap_or(30000),
+        ),
         use_checkpoints: doc
             .get("use_checkpoints")
             .and_then(|c| c.as_bool())
@@ -489,7 +497,7 @@ pub async fn start_transient(app: App, doc: Value) -> Result<Value, String> {
             spec.target_url,
             spec.opts,
         ));
-        return Ok(json!({"ok": true, "_local_id": spec.rep_id}));
+        return Ok(json!({"ok": true, "_local_id": job.task_id()}));
     }
 
     let retry = RetryPolicy::default();
@@ -519,18 +527,15 @@ pub async fn cancel_transient(app: &App, doc: &Value) -> Result<Option<Value>, S
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let rep_id = match explicit {
-        Some(id) => id,
+        // The transient map is keyed by the base id; displayed ids may carry
+        // "+continuous"-style suffixes.
+        Some(id) => id.split('+').next().unwrap_or(&id).to_string(),
         None => build_spec(app, doc).await?.rep_id,
     };
-    let mut transient = app.repl.transient.lock().unwrap();
-    // rep_id carries "+continuous" for continuous jobs; accept it bare too.
-    let key = [rep_id.clone(), format!("{rep_id}+continuous")]
-        .into_iter()
-        .find(|k| transient.contains_key(k));
-    Ok(key.map(|k| {
-        let j = transient.remove(&k).unwrap();
+    let job = app.repl.transient.lock().unwrap().remove(&rep_id);
+    Ok(job.map(|j| {
         j.cancel.cancel();
-        json!({"ok": true, "_local_id": k})
+        json!({"ok": true, "_local_id": j.task_id()})
     }))
 }
 

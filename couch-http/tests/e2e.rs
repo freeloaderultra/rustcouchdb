@@ -579,7 +579,9 @@ async fn auth_and_soft_delete_validator() {
         .unwrap();
     assert_eq!(r.status().as_u16(), 401);
 
-    // Soft-delete validator (native port of nxguide's JS rule)
+    // Soft-delete validator (native port of nxguide's JS rule). Enforcement is
+    // per-db: it only applies once the _design/nxguide validator ddoc exists,
+    // exactly like installing the JS validator on stock CouchDB.
     let put = |url: String, body: Value| {
         let cc = cc.clone();
         async move {
@@ -596,6 +598,24 @@ async fn auth_and_soft_delete_validator() {
     .await;
     assert_eq!(s, 201);
     let rev = v["rev"].as_str().unwrap().to_string();
+    // Without the validator ddoc installed a bare tombstone is fine: check via
+    // a throwaway doc (stock CouchDB without the ddoc allows it too).
+    let (s, v2) = put(format!("{b}/vdb/unvalidated"), json!({"db": {"CreatedByUid": "u9"}})).await;
+    assert_eq!(s, 201);
+    let rev2 = v2["rev"].as_str().unwrap();
+    let r = cc
+        .delete(format!("{b}/vdb/unvalidated?rev={rev2}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    // Install the validator ddoc (JS body stored inert; id triggers the native rule).
+    let (s, _) = put(
+        format!("{b}/vdb/_design/nxguide"),
+        json!({"language": "javascript", "validate_doc_update": "function (newDoc, oldDoc) { /* enforced natively */ }"}),
+    )
+    .await;
+    assert_eq!(s, 201);
     // Delete without metadata → 403 (DELETE builds a bare tombstone)
     let r = cc
         .delete(format!("{b}/vdb/task1?rev={rev}"))

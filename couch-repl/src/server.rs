@@ -192,7 +192,6 @@ impl ServerState {
             &source.normalized_url(),
             &target.normalized_url(),
             &filter,
-            spec.continuous,
             spec.winning_revs_only,
         );
         let name = spec

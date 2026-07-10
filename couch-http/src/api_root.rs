@@ -123,7 +123,7 @@ pub async fn scheduler_jobs(State(state): State<App>) -> ApiResult<Response> {
         .filter(|j| !matches!(j.scheduler_state(), "completed" | "failed"))
         .map(|j| {
             json!({
-                "id": j.rep_id,
+                "id": j.task_id(),
                 "database": if j.doc_id.is_empty() { Value::Null } else { json!("_replicator") },
                 "doc_id": if j.doc_id.is_empty() { Value::Null } else { json!(j.doc_id.clone()) },
                 "node": "nonode@nohost",

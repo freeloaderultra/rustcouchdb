@@ -242,8 +242,27 @@ impl ServerState {
     }
 
     /// The validator applied to interactive writes on this db (if any).
+    ///
+    /// Enforcement is per-database, like CouchDB: the native rule only kicks
+    /// in once the client has installed its `_design/nxguide` validator design
+    /// doc there (the JS body itself stays inert). Databases without the ddoc
+    /// accept writes unvalidated, exactly as stock CouchDB would.
     pub fn validator_for(&self, db_name: &str) -> Option<couch_store::writer::Validator<'static>> {
-        if self.soft_delete_validator && !db_name.starts_with('_') {
+        if !self.soft_delete_validator || db_name.starts_with('_') {
+            return None;
+        }
+        let Ok(dbh) = self.db(db_name) else { return None };
+        let snap = dbh.snapshot();
+        let installed = snap
+            .open_doc(b"_design/nxguide", None, &Default::default())
+            .ok()
+            .flatten()
+            .map(|d| {
+                d.get("_deleted") != Some(&Value::Bool(true))
+                    && d.get("validate_doc_update").map(|v| !v.is_null()).unwrap_or(false)
+            })
+            .unwrap_or(false);
+        if installed {
             Some(&crate::validate::nxguide_soft_delete)
         } else {
             None
