@@ -1,0 +1,175 @@
+//! Query-string and body helpers shared by the handlers.
+
+use crate::error::{ApiError, ApiResult};
+use serde_json::Value;
+use std::collections::HashMap;
+
+pub type Q = HashMap<String, String>;
+
+pub fn qbool(q: &Q, name: &str, default: bool) -> bool {
+    match q.get(name).map(|s| s.as_str()) {
+        Some("true") | Some("1") => true,
+        Some("false") | Some("0") => false,
+        _ => default,
+    }
+}
+
+pub fn qu64(q: &Q, name: &str) -> Option<u64> {
+    q.get(name).and_then(|s| s.parse().ok())
+}
+
+/// A query param that is itself JSON (startkey="abc", keys=["a","b"]).
+pub fn qjson(q: &Q, name: &str) -> ApiResult<Option<Value>> {
+    match q.get(name) {
+        None => Ok(None),
+        Some(s) => serde_json::from_str(s)
+            .map(Some)
+            .map_err(|e| ApiError::bad_request(format!("invalid JSON for `{name}`: {e}"))),
+    }
+}
+
+pub fn parse_json(body: &[u8]) -> ApiResult<Value> {
+    if body.is_empty() {
+        return Ok(Value::Object(Default::default()));
+    }
+    serde_json::from_slice(body).map_err(|e| ApiError::bad_request(format!("invalid UTF-8 JSON: {e}")))
+}
+
+/// The winner rev string of a FullDocInfo.
+pub fn winner_rev(fdi: &couch_store::db::FullDocInfo) -> Option<String> {
+    fdi.rev_tree
+        .winner()
+        .map(|w| couch_store::doc::rev_str(w.pos, w.path[0]))
+}
+
+/// Parse `multipart/related` (RFC 2387) as CouchDB uses it for doc PUTs:
+/// part 1 is the JSON doc, following parts are attachment bodies in the
+/// order of `"follows": true` entries in `_attachments`.
+pub fn parse_multipart_related(content_type: &str, body: &[u8]) -> ApiResult<Value> {
+    let boundary = content_type
+        .split(';')
+        .filter_map(|p| p.trim().strip_prefix("boundary="))
+        .next()
+        .map(|b| b.trim_matches('"').to_string())
+        .ok_or_else(|| ApiError::bad_request("multipart/related without boundary"))?;
+    let delim = format!("--{boundary}");
+    let mut parts: Vec<&[u8]> = Vec::new();
+    let mut rest = body;
+    // Find each boundary line; content between boundaries is a part.
+    let positions: Vec<usize> = find_all(rest, delim.as_bytes());
+    for w in positions.windows(2) {
+        let start = w[0] + delim.len();
+        let part = &rest[start..w[1]];
+        parts.push(part);
+    }
+    if positions.len() == 1 {
+        // Possibly terminated by --boundary-- on the same find
+        rest = &rest[positions[0] + delim.len()..];
+        parts.push(rest);
+    }
+    let mut bodies = Vec::new();
+    for p in parts {
+        // Skip a leading -- (final delimiter) and CRLF
+        let p = p.strip_prefix(b"--".as_slice()).unwrap_or(p);
+        let p = strip_crlf(p);
+        if p.is_empty() {
+            continue;
+        }
+        // Split headers from body at the first blank line.
+        let body = match find(p, b"\r\n\r\n") {
+            Some(i) => &p[i + 4..],
+            None => match find(p, b"\n\n") {
+                Some(i) => &p[i + 2..],
+                None => p, // no headers at all
+            },
+        };
+        bodies.push(trim_trailing_crlf(body).to_vec());
+    }
+    if bodies.is_empty() {
+        return Err(ApiError::bad_request("empty multipart body"));
+    }
+    let mut doc: Value = serde_json::from_slice(&bodies[0])
+        .map_err(|e| ApiError::bad_request(format!("bad JSON part: {e}")))?;
+    // Attach the following parts to the follows-attachments in order.
+    let mut next = 1;
+    if let Some(Value::Object(atts)) = doc.get_mut("_attachments") {
+        use base64::Engine;
+        for (_, spec) in atts.iter_mut() {
+            if matches!(spec.get("follows"), Some(Value::Bool(true))) {
+                let Some(data) = bodies.get(next) else {
+                    return Err(ApiError::bad_request("multipart part count mismatch"));
+                };
+                next += 1;
+                let obj = spec.as_object_mut().unwrap();
+                obj.remove("follows");
+                obj.insert(
+                    "data".into(),
+                    Value::String(base64::engine::general_purpose::STANDARD.encode(data)),
+                );
+            }
+        }
+    }
+    Ok(doc)
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn find_all(hay: &[u8], needle: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut off = 0;
+    while let Some(i) = find(&hay[off..], needle) {
+        out.push(off + i);
+        off += i + needle.len();
+    }
+    out
+}
+
+fn strip_crlf(mut p: &[u8]) -> &[u8] {
+    while p.first() == Some(&b'\r') || p.first() == Some(&b'\n') {
+        p = &p[1..];
+    }
+    p
+}
+
+fn trim_trailing_crlf(mut p: &[u8]) -> &[u8] {
+    while p.last() == Some(&b'\r') || p.last() == Some(&b'\n') {
+        p = &p[..p.len() - 1];
+    }
+    p
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn multipart_related_roundtrip() {
+        let doc = json!({
+            "_id": "d", "v": 1,
+            "_attachments": {
+                "a.bin": {"follows": true, "content_type": "application/octet-stream", "length": 3},
+                "b.bin": {"follows": true, "content_type": "text/plain", "length": 4},
+            }
+        });
+        let b = "xyz";
+        let body = format!(
+            "--{b}\r\ncontent-type: application/json\r\n\r\n{doc}\r\n--{b}\r\n\r\nAAA\r\n--{b}\r\n\r\nBBBB\r\n--{b}--",
+        );
+        let parsed =
+            parse_multipart_related(&format!("multipart/related; boundary=\"{b}\""), body.as_bytes())
+                .unwrap();
+        use base64::Engine;
+        assert_eq!(
+            parsed["_attachments"]["a.bin"]["data"],
+            json!(base64::engine::general_purpose::STANDARD.encode("AAA"))
+        );
+        assert_eq!(
+            parsed["_attachments"]["b.bin"]["data"],
+            json!(base64::engine::general_purpose::STANDARD.encode("BBBB"))
+        );
+        assert_eq!(parsed["v"], json!(1));
+    }
+}

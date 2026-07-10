@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
+#[derive(Clone)]
 pub struct RepOptions {
     pub continuous: bool,
     /// Replicate only winning revisions (CouchDB's winning_revs_only;

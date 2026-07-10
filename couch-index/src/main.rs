@@ -1,7 +1,4 @@
-mod find;
-mod index;
-mod keys;
-mod planner;
+use couch_index::{find, index};
 
 use clap::{Parser, Subcommand};
 use couch_store::db::Db;

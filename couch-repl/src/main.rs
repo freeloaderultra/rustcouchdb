@@ -1,27 +1,10 @@
-mod attachments;
-mod changes;
-mod checkpoint;
-mod cli;
-mod client;
-mod error;
-mod fetch;
-mod gen;
-mod ids;
-mod pipeline;
-mod retry;
-mod revs_diff;
-mod seq;
-mod server;
-mod stats;
-mod util;
-mod write;
-
 use clap::Parser;
-use cli::{parse_headers, Cli, Cmd};
-use client::Endpoint;
-use error::Error;
-use ids::Filter;
-use retry::RetryPolicy;
+use couch_repl::cli::{self, parse_headers, Cli, Cmd};
+use couch_repl::client::Endpoint;
+use couch_repl::error::Error;
+use couch_repl::ids::{self, Filter};
+use couch_repl::retry::RetryPolicy;
+use couch_repl::{gen, pipeline, server, stats};
 use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 

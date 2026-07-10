@@ -154,6 +154,80 @@ impl RevTree {
         self.0 = new_tree.0;
     }
 
+    /// Every revision in the tree as (pos, revid) — couch_key_tree:get_all_leafs
+    /// plus interior nodes; what _revs_diff checks membership against.
+    pub fn all_revs(&self) -> Vec<(u64, &[u8])> {
+        fn walk<'a>(pos: u64, node: &'a RevNode, out: &mut Vec<(u64, &'a [u8])>) {
+            out.push((pos, &node.key));
+            for c in &node.children {
+                walk(pos + 1, c, out);
+            }
+        }
+        let mut out = Vec::new();
+        for (start, root) in &self.0 {
+            walk(*start, root, &mut out);
+        }
+        out
+    }
+
+    /// Find one revision anywhere in the tree (leaf or interior) with its
+    /// ancestor path. Interior nodes keep their values until compaction, so
+    /// old revisions stay readable — same as couch_db:open_doc with rev.
+    pub fn rev_path(&self, pos: u64, revid: &[u8]) -> Option<LeafPath<'_>> {
+        fn walk<'a>(
+            cur: u64,
+            node: &'a RevNode,
+            stack: &mut Vec<&'a [u8]>,
+            pos: u64,
+            revid: &[u8],
+        ) -> Option<LeafPath<'a>> {
+            stack.push(&node.key);
+            if cur == pos && node.key == revid {
+                let mut path: Vec<&'a [u8]> = stack.clone();
+                path.reverse();
+                stack.pop();
+                return Some(LeafPath {
+                    pos,
+                    path,
+                    leaf: &node.val,
+                });
+            }
+            if cur < pos {
+                for c in &node.children {
+                    if let Some(found) = walk(cur + 1, c, stack, pos, revid) {
+                        stack.pop();
+                        return Some(found);
+                    }
+                }
+            }
+            stack.pop();
+            None
+        }
+        for (start, root) in &self.0 {
+            if *start > pos {
+                continue;
+            }
+            let mut stack = Vec::new();
+            if let Some(found) = walk(*start, root, &mut stack, pos, revid) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// Leaves whose path passes through (pos, revid) — the `latest=true`
+    /// resolution: a requested rev maps to its leaf descendant(s).
+    pub fn descendant_leaves(&self, pos: u64, revid: &[u8]) -> Vec<LeafPath<'_>> {
+        self.leaves()
+            .into_iter()
+            .filter(|l| {
+                l.pos >= pos
+                    && (l.pos - pos) < l.path.len() as u64
+                    && l.path[(l.pos - pos) as usize] == revid
+            })
+            .collect()
+    }
+
     /// Full paths including values: [(LeafPos, [(RevId, Val) leaf-first])].
     fn full_leaf_paths(&self) -> Vec<(u64, Vec<(Vec<u8>, RevVal)>)> {
         let mut out = Vec::new();

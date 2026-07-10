@@ -254,19 +254,44 @@ impl Db {
         let Some(fdi) = self.open_doc_info(id)? else {
             return Ok(None);
         };
-        let leaves = fdi.rev_tree.leaves();
         let chosen: Option<LeafPath<'_>> = match rev {
             None => fdi.rev_tree.winner(),
             Some(r) => {
                 let (pos, revid) = doc::parse_rev(r)?;
-                leaves
-                    .into_iter()
-                    .find(|l| l.pos == pos && l.path[0] == revid.as_slice())
+                fdi.rev_tree.rev_path(pos, &revid)
             }
         };
         match chosen {
             None => Ok(None),
             Some(leaf) => Ok(Some(self.doc_json(&fdi, &leaf, opts)?)),
+        }
+    }
+
+    /// Read one `_local/...` doc by full id.
+    pub fn open_local(&self, id: &[u8]) -> Result<Option<Value>> {
+        let key = Term::Bin(id.to_vec());
+        let res = btree::lookup(&self.file, &self.local_root, std::slice::from_ref(&key))?;
+        match &res[0] {
+            None => Ok(None),
+            Some(v) => {
+                let pair = v.tuple_n(2)?;
+                let rev = match &pair[0] {
+                    Term::Int(i) => i.to_string(),
+                    Term::Bin(b) => String::from_utf8_lossy(b).into_owned(),
+                    other => return Err(corrupt(format!("bad local doc rev: {other:?}"))),
+                };
+                let mut m = Map::new();
+                m.insert(
+                    "_id".into(),
+                    Value::String(String::from_utf8_lossy(id).into_owned()),
+                );
+                m.insert("_rev".into(), Value::String(format!("0-{rev}")));
+                match ejson::to_json(&pair[1])? {
+                    Value::Object(o) => m.extend(o),
+                    other => return Err(corrupt(format!("local doc body not an object: {other}"))),
+                }
+                Ok(Some(Value::Object(m)))
+            }
         }
     }
 
