@@ -30,14 +30,16 @@ const PENDING_SEQ: u64 = u64::MAX;
 
 fn assign_pending_seqs(tree: &mut RevTree, seq: u64) {
     fn walk(node: &mut crate::revtree::RevNode, seq: u64) {
-        if let RevVal::Leaf(l) = &mut node.val {
-            if l.seq == PENDING_SEQ {
-                l.seq = seq;
+        crate::maybe_grow(|| {
+            if let RevVal::Leaf(l) = &mut node.val {
+                if l.seq == PENDING_SEQ {
+                    l.seq = seq;
+                }
             }
-        }
-        for c in &mut node.children {
-            walk(c, seq);
-        }
+            for c in &mut node.children {
+                walk(c, seq);
+            }
+        })
     }
     for (_, root) in &mut tree.0 {
         walk(root, seq);
@@ -649,10 +651,15 @@ impl DbWriter {
     }
 
     pub fn set_security(&mut self, v: &Value) -> Result<()> {
-        let inner = match ejson::from_json(v) {
-            Term::Tuple(mut t) if t.len() == 1 => t.remove(0),
-            other => other,
-        };
+        // Term has a manual Drop, so the tuple's payload can't be moved out
+        // by pattern; unwrap the 1-tuple via a mutable borrow instead.
+        let mut inner = ejson::from_json(v);
+        if let Term::Tuple(t) = &mut inner {
+            if t.len() == 1 {
+                let first = t.remove(0);
+                inner = first;
+            }
+        }
         let (ptr, _) = self.file.append_term(&inner)?;
         self.header.security_ptr = Term::Int(ptr as i64);
         Ok(())

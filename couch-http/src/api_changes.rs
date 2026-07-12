@@ -7,8 +7,7 @@ use crate::state::{blocking, parse_seq, seq_json, App, Database};
 use crate::util::{parse_json, qbool, qjson, qu64, Q};
 use axum::extract::{Path, Query, State};
 use axum::http::header;
-use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::response::Response;
 use bytes::Bytes;
 use couch_store::db::{Db, DocOpts, FullDocInfo};
 use couch_store::doc as docmod;
@@ -204,13 +203,15 @@ async fn changes_inner(
     match feed.as_str() {
         "continuous" => Ok(continuous(dbh, since, opts, heartbeat, timeout)),
         "longpoll" => {
-            let (rows, last_seq) = {
+            // Probe for one matching row; the full response is streamed so a
+            // huge backlog never materialises in memory.
+            let probe = {
                 let dbh = dbh.clone();
                 let opts = opts.clone();
-                blocking(move || scan(&dbh.snapshot(), since, &opts, opts.limit))?
+                blocking(move || scan(&dbh.snapshot(), since, &opts, 1))?
             };
-            if !rows.is_empty() {
-                return Ok(normal_response(rows, last_seq, update_seq));
+            if !probe.0.is_empty() {
+                return Ok(stream_normal(dbh, since, opts, update_seq));
             }
             // Wait for a write past `since`, then rescan once. Check the
             // current seq BEFORE waiting each round: a write that lands
@@ -232,30 +233,75 @@ async fn changes_inner(
                     }
                 }
             }
-            let dbh2 = dbh.clone();
-            let opts2 = opts.clone();
-            let (rows, last_seq) =
-                blocking(move || scan(&dbh2.snapshot(), since, &opts2, opts2.limit))?;
             let update_seq = dbh.snapshot().header.update_seq;
-            Ok(normal_response(rows, last_seq, update_seq))
+            Ok(stream_normal(dbh, since, opts, update_seq))
         }
-        _ => {
-            let (rows, last_seq) =
-                blocking(|| scan(&dbh.snapshot(), since, &opts, opts.limit))?;
-            let update_seq = dbh.snapshot().header.update_seq;
-            Ok(normal_response(rows, last_seq, update_seq))
-        }
+        _ => Ok(stream_normal(dbh, since, opts, update_seq)),
     }
 }
 
-fn normal_response(rows: Vec<Value>, last_seq: u64, update_seq: u64) -> Response {
-    let pending = update_seq.saturating_sub(last_seq);
-    Json(json!({
-        "results": rows,
-        "last_seq": seq_json(last_seq),
-        "pending": pending,
-    }))
-    .into_response()
+/// feed=normal (and the longpoll response): stream the rows as they come off
+/// the seq tree. A `since=0` scan of a million-change db must never buffer
+/// the whole result — that OOMs small hosts (CouchDB streams here too).
+fn stream_normal(dbh: Arc<Database>, since: u64, opts: ChangesOpts, update_seq: u64) -> Response {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::convert::Infallible>>(8);
+    tokio::task::spawn_blocking(move || {
+        let snap = dbh.snapshot();
+        let mut last_seq = since;
+        let mut sent = 0u64;
+        let mut first = true;
+        let mut client_gone = false;
+        let mut buf = String::with_capacity(96 * 1024);
+        buf.push_str("{\"results\":[\n");
+        let res = snap.fold_changes(since, |fdi| {
+            last_seq = fdi.update_seq;
+            if let Some(row) = change_row(&snap, &fdi, &opts)? {
+                if !first {
+                    buf.push_str(",\n");
+                }
+                first = false;
+                buf.push_str(&row.to_string());
+                sent += 1;
+                if buf.len() >= 64 * 1024
+                    && tx
+                        .blocking_send(Ok(Bytes::from(std::mem::take(&mut buf))))
+                        .is_err()
+                {
+                    client_gone = true;
+                    return Ok(ControlFlow::Break(()));
+                }
+                if sent >= opts.limit {
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+            Ok(ControlFlow::Continue(()))
+        });
+        if client_gone {
+            return;
+        }
+        match res {
+            Ok(()) => {
+                let pending = update_seq.saturating_sub(last_seq);
+                buf.push_str(&format!(
+                    "\n],\n\"last_seq\":{},\"pending\":{}}}\n",
+                    seq_json(last_seq),
+                    pending
+                ));
+                let _ = tx.blocking_send(Ok(Bytes::from(buf)));
+            }
+            Err(e) => {
+                // The 200 and part of the body are already on the wire; all
+                // we can do is truncate so the client's JSON parse fails.
+                tracing::error!("_changes scan failed mid-stream: {e:?}");
+            }
+        }
+    });
+    let mut resp = Response::new(axum::body::Body::from_stream(ReceiverStream::new(rx)));
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/json"),
+    );
+    resp
 }
 
 /// feed=continuous: newline-delimited rows until the client goes away
@@ -269,16 +315,20 @@ fn continuous(
 ) -> Response {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::convert::Infallible>>(64);
     tokio::spawn(async move {
+        // Backlog drains in bounded batches so a since=0 feed over millions
+        // of changes never buffers the whole result (that OOMs small hosts).
+        const DRAIN_BATCH: u64 = 4096;
         let mut since = since;
         let mut remaining = opts.limit;
         let mut seq_rx = dbh.seq_rx.clone();
         loop {
             // Drain what's there.
+            let batch = remaining.min(DRAIN_BATCH);
             let (rows, last_seq) = {
                 let dbh = dbh.clone();
                 let opts = opts.clone();
                 match tokio::task::spawn_blocking(move || {
-                    scan(&dbh.snapshot(), since, &opts, u64::MAX)
+                    scan(&dbh.snapshot(), since, &opts, batch)
                 })
                 .await
                 {
@@ -287,6 +337,7 @@ fn continuous(
                 }
             };
             since = since.max(last_seq);
+            let more_backlog = rows.len() as u64 >= batch;
             for row in rows {
                 if remaining == 0 {
                     break;
@@ -300,6 +351,9 @@ fn continuous(
             }
             if remaining == 0 {
                 break;
+            }
+            if more_backlog {
+                continue; // keep draining before waiting for new writes
             }
             // A write may have landed between the scan and now — rescan
             // immediately instead of waiting (else the event is stuck until

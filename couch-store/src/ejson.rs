@@ -7,6 +7,10 @@ use crate::etf::Term;
 use serde_json::{Map, Number, Value};
 
 pub fn to_json(t: &Term) -> Result<Value> {
+    crate::maybe_grow(|| to_json_inner(t))
+}
+
+fn to_json_inner(t: &Term) -> Result<Value> {
     Ok(match t {
         Term::Atom(a) => match a.as_str() {
             "true" => Value::Bool(true),
@@ -37,6 +41,10 @@ pub fn to_json(t: &Term) -> Result<Value> {
 }
 
 pub fn from_json(v: &Value) -> Term {
+    crate::maybe_grow(|| from_json_inner(v))
+}
+
+fn from_json_inner(v: &Value) -> Term {
     match v {
         Value::Null => Term::atom("null"),
         Value::Bool(true) => Term::atom("true"),

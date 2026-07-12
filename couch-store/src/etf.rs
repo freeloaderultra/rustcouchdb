@@ -9,7 +9,6 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::io::Read;
 
-#[derive(Clone, PartialEq)]
 pub enum Term {
     Int(i64),
     Float(f64),
@@ -17,6 +16,51 @@ pub enum Term {
     Bin(Vec<u8>),
     List(Vec<Term>),
     Tuple(Vec<Term>),
+}
+
+// Clone/PartialEq/Drop are hand-written instead of derived: the derived
+// impls recurse once per nesting level and rev-tree terms nest once per
+// revision, so a deep tree would overflow the stack. Each impl re-checks
+// headroom per level via maybe_grow.
+impl Clone for Term {
+    fn clone(&self) -> Term {
+        crate::maybe_grow(|| match self {
+            Term::Int(i) => Term::Int(*i),
+            Term::Float(x) => Term::Float(*x),
+            Term::Atom(a) => Term::Atom(a.clone()),
+            Term::Bin(b) => Term::Bin(b.clone()),
+            Term::List(v) => Term::List(v.clone()),
+            Term::Tuple(v) => Term::Tuple(v.clone()),
+        })
+    }
+}
+
+impl PartialEq for Term {
+    fn eq(&self, other: &Term) -> bool {
+        crate::maybe_grow(|| match (self, other) {
+            (Term::Int(a), Term::Int(b)) => a == b,
+            (Term::Float(a), Term::Float(b)) => a == b,
+            (Term::Atom(a), Term::Atom(b)) => a == b,
+            (Term::Bin(a), Term::Bin(b)) => a == b,
+            (Term::List(a), Term::List(b)) => a == b,
+            (Term::Tuple(a), Term::Tuple(b)) => a == b,
+            _ => false,
+        })
+    }
+}
+
+impl Drop for Term {
+    fn drop(&mut self) {
+        match self {
+            Term::List(v) | Term::Tuple(v) => {
+                if !v.is_empty() {
+                    let v = std::mem::take(v);
+                    crate::maybe_grow(|| drop(v));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Term {
@@ -76,7 +120,7 @@ impl Term {
 
 impl fmt::Debug for Term {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
+        crate::maybe_grow(|| match self {
             Term::Int(i) => write!(f, "{i}"),
             Term::Float(x) => write!(f, "{x}"),
             Term::Atom(a) => write!(f, "'{a}'"),
@@ -95,7 +139,7 @@ impl fmt::Debug for Term {
                 }
                 write!(f, "}}")
             }
-        }
+        })
     }
 }
 
@@ -111,7 +155,7 @@ pub fn cmp(a: &Term, b: &Term) -> Ordering {
             Term::Bin(_) => 4,
         }
     }
-    match (a, b) {
+    crate::maybe_grow(|| match (a, b) {
         (Term::Int(x), Term::Int(y)) => x.cmp(y),
         (Term::Int(x), Term::Float(y)) => cmp_f64(*x as f64, *y),
         (Term::Float(x), Term::Int(y)) => cmp_f64(*x, *y as f64),
@@ -124,7 +168,7 @@ pub fn cmp(a: &Term, b: &Term) -> Ordering {
         (Term::List(x), Term::List(y)) => cmp_seq(x, y),
         (Term::Bin(x), Term::Bin(y)) => x.cmp(y),
         _ => rank(a).cmp(&rank(b)),
-    }
+    })
 }
 
 fn cmp_f64(x: f64, y: f64) -> Ordering {
@@ -196,6 +240,10 @@ impl<'a> Reader<'a> {
     }
 
     fn term(&mut self) -> Result<Term> {
+        crate::maybe_grow(|| self.term_inner())
+    }
+
+    fn term_inner(&mut self) -> Result<Term> {
         let tag = self.u8()?;
         match tag {
             97 => Ok(Term::Int(self.u8()? as i64)),
@@ -318,7 +366,7 @@ pub fn external_size(t: &Term) -> usize {
 }
 
 fn enc(t: &Term, out: &mut Vec<u8>) {
-    match t {
+    crate::maybe_grow(|| match t {
         Term::Int(i) => {
             let i = *i;
             if (0..=255).contains(&i) {
@@ -385,7 +433,7 @@ fn enc(t: &Term, out: &mut Vec<u8>) {
                 enc(e, out);
             }
         }
-    }
+    })
 }
 
 #[cfg(test)]

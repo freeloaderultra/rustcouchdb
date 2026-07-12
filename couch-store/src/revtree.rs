@@ -24,11 +24,33 @@ pub enum RevVal {
     Leaf(LeafVal),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct RevNode {
     pub key: Vec<u8>,
     pub val: RevVal,
     pub children: Vec<RevNode>,
+}
+
+// Manual Clone/Drop: the derived impls recurse once per tree level and
+// production trees reach tens of thousands of levels (delete/recreate
+// churn) — see crate::maybe_grow.
+impl Clone for RevNode {
+    fn clone(&self) -> RevNode {
+        crate::maybe_grow(|| RevNode {
+            key: self.key.clone(),
+            val: self.val.clone(),
+            children: self.children.clone(),
+        })
+    }
+}
+
+impl Drop for RevNode {
+    fn drop(&mut self) {
+        if !self.children.is_empty() {
+            let children = std::mem::take(&mut self.children);
+            crate::maybe_grow(|| drop(children));
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -195,15 +217,17 @@ impl RevTree {
     /// a fresh update_seq so the doc reappears on the changes feed).
     pub fn set_leaf_seq(&mut self, pos: u64, revid: &[u8], seq: u64) {
         fn walk(cur: u64, node: &mut RevNode, pos: u64, revid: &[u8], seq: u64) {
-            if cur == pos && node.key == revid {
-                if let RevVal::Leaf(l) = &mut node.val {
-                    l.seq = seq;
+            crate::maybe_grow(|| {
+                if cur == pos && node.key == revid {
+                    if let RevVal::Leaf(l) = &mut node.val {
+                        l.seq = seq;
+                    }
+                    return;
                 }
-                return;
-            }
-            for c in &mut node.children {
-                walk(cur + 1, c, pos, revid, seq);
-            }
+                for c in &mut node.children {
+                    walk(cur + 1, c, pos, revid, seq);
+                }
+            })
         }
         for (start, root) in &mut self.0 {
             walk(*start, root, pos, revid, seq);
@@ -214,10 +238,12 @@ impl RevTree {
     /// plus interior nodes; what _revs_diff checks membership against.
     pub fn all_revs(&self) -> Vec<(u64, &[u8])> {
         fn walk<'a>(pos: u64, node: &'a RevNode, out: &mut Vec<(u64, &'a [u8])>) {
-            out.push((pos, &node.key));
-            for c in &node.children {
-                walk(pos + 1, c, out);
-            }
+            crate::maybe_grow(|| {
+                out.push((pos, &node.key));
+                for c in &node.children {
+                    walk(pos + 1, c, out);
+                }
+            })
         }
         let mut out = Vec::new();
         for (start, root) in &self.0 {
@@ -231,6 +257,15 @@ impl RevTree {
     /// old revisions stay readable — same as couch_db:open_doc with rev.
     pub fn rev_path(&self, pos: u64, revid: &[u8]) -> Option<LeafPath<'_>> {
         fn walk<'a>(
+            cur: u64,
+            node: &'a RevNode,
+            stack: &mut Vec<&'a [u8]>,
+            pos: u64,
+            revid: &[u8],
+        ) -> Option<LeafPath<'a>> {
+            crate::maybe_grow(|| walk_inner(cur, node, stack, pos, revid))
+        }
+        fn walk_inner<'a>(
             cur: u64,
             node: &'a RevNode,
             stack: &mut Vec<&'a [u8]>,
@@ -301,6 +336,15 @@ fn full_paths(
     stack: &mut Vec<(Vec<u8>, RevVal)>,
     out: &mut Vec<(u64, Vec<(Vec<u8>, RevVal)>)>,
 ) {
+    crate::maybe_grow(|| full_paths_inner(pos, node, stack, out))
+}
+
+fn full_paths_inner(
+    pos: u64,
+    node: &RevNode,
+    stack: &mut Vec<(Vec<u8>, RevVal)>,
+    out: &mut Vec<(u64, Vec<(Vec<u8>, RevVal)>)>,
+) {
     stack.push((node.key.clone(), node.val.clone()));
     if node.children.is_empty() {
         let mut path = stack.clone();
@@ -315,6 +359,15 @@ fn full_paths(
 }
 
 fn collect_leaves<'a>(
+    pos: u64,
+    node: &'a RevNode,
+    stack: &mut Vec<&'a [u8]>,
+    out: &mut Vec<LeafPath<'a>>,
+) {
+    crate::maybe_grow(|| collect_leaves_inner(pos, node, stack, out))
+}
+
+fn collect_leaves_inner<'a>(
     pos: u64,
     node: &'a RevNode,
     stack: &mut Vec<&'a [u8]>,
@@ -338,6 +391,10 @@ fn collect_leaves<'a>(
 }
 
 fn node_from_term(t: &Term) -> Result<RevNode> {
+    crate::maybe_grow(|| node_from_term_inner(t))
+}
+
+fn node_from_term_inner(t: &Term) -> Result<RevNode> {
     let tup = t.tuple_n(3)?;
     let key = tup[0].as_bin()?.to_vec();
     let val = val_from_term(&tup[1])?;
@@ -376,6 +433,10 @@ fn val_from_term(t: &Term) -> Result<RevVal> {
 }
 
 fn node_to_term(n: &RevNode) -> Term {
+    crate::maybe_grow(|| node_to_term_inner(n))
+}
+
+fn node_to_term_inner(n: &RevNode) -> Term {
     let val = match &n.val {
         RevVal::Missing => Term::List(vec![]),
         RevVal::Leaf(l) => Term::Tuple(vec![
@@ -421,6 +482,10 @@ fn merge_tree(
 
 /// couch_key_tree:merge_at — mutates `nodes` in place on success.
 fn merge_at(nodes: &mut Vec<RevNode>, pos: i64, inode: &RevNode) -> bool {
+    crate::maybe_grow(|| merge_at_inner(nodes, pos, inode))
+}
+
+fn merge_at_inner(nodes: &mut Vec<RevNode>, pos: i64, inode: &RevNode) -> bool {
     if nodes.is_empty() {
         return false;
     }
@@ -486,6 +551,10 @@ fn merge_at(nodes: &mut Vec<RevNode>, pos: i64, inode: &RevNode) -> bool {
 
 /// couch_key_tree:merge_extend — merge the linear insert chain into siblings.
 fn merge_extend(nodes: &mut Vec<RevNode>, ins: &[RevNode]) {
+    crate::maybe_grow(|| merge_extend_inner(nodes, ins))
+}
+
+fn merge_extend_inner(nodes: &mut Vec<RevNode>, ins: &[RevNode]) {
     if ins.is_empty() {
         return;
     }
@@ -617,6 +686,60 @@ mod tests {
         assert_eq!(leaves[0].pos, 10);
         assert_eq!(leaves[0].path.len(), 3);
         assert_eq!(tree.0[0].0, 8); // start depth after stemming
+    }
+
+    /// Depth-independence: production trees reach thousands of levels
+    /// (delete/recreate churn stacks stemmed histories), and every code path
+    /// that recurses per level must survive on a small thread stack. 50k
+    /// levels on 256 KiB exercises merge, term roundtrip, walks, stem,
+    /// clone, eq, and drop through the maybe_grow guards.
+    #[test]
+    fn very_deep_tree_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let depth = 50_000u64;
+                let path: Vec<Vec<u8>> =
+                    (0..depth).rev().map(|i| rev(&format!("r{i:06}"))).collect();
+                let (s, n) = path_to_tree(depth, &path, leaf(1));
+                let mut tree = RevTree::default();
+                tree.merge_path(s, n);
+
+                let t = tree.to_term();
+                let buf = crate::etf::encode(&t);
+                let dec = crate::etf::decode(&buf).unwrap();
+                let tree2 = RevTree::from_term(&dec).unwrap();
+                assert!(dec == t);
+
+                assert_eq!(tree2.all_revs().len(), depth as usize);
+                let leaves = tree2.leaves();
+                assert_eq!(leaves.len(), 1);
+                assert_eq!(leaves[0].path.len(), depth as usize);
+                assert_eq!(tree2.winner().unwrap().pos, depth);
+                assert!(tree2
+                    .rev_path(depth, &rev(&format!("r{:06}", depth - 1)))
+                    .is_some());
+
+                let cloned = tree2.clone();
+                assert_eq!(cloned.leaves().len(), 1);
+
+                let mut stemmed = tree2.clone();
+                stemmed.stem(1000);
+                assert_eq!(stemmed.leaves()[0].path.len(), 1000);
+
+                // extend the deep tree by one more rev (writer update path)
+                let mut tree3 = tree2.clone();
+                let (s, n) = path_to_tree(
+                    depth + 1,
+                    &[rev("tip"), rev(&format!("r{:06}", depth - 1))],
+                    leaf(2),
+                );
+                assert!(tree3.merge_path(s, n));
+                assert_eq!(tree3.winner().unwrap().pos, depth + 1);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     #[test]
