@@ -727,3 +727,98 @@ async fn purge_docs() {
     assert_eq!(s, 201);
     assert_eq!(v["purged"]["cft"].as_array().unwrap().len(), 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prometheus_metrics() {
+    let srv = start(Some("admin:secret"), false).await;
+    let c = client();
+    let b = &srv.base;
+    let with_auth = |url: String| c.get(url).basic_auth("admin", Some("secret"));
+
+    // Admin-gated like upstream (chttpd requires _admin/_metrics for _prometheus).
+    let r = c.get(format!("{b}/_node/_local/_prometheus")).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 401);
+
+    // Generate traffic: create a db, write, read, bulk write.
+    let mkurl = format!("{b}/mdb");
+    assert_eq!(c.put(&mkurl).basic_auth("admin", Some("secret")).send().await.unwrap().status().as_u16(), 201);
+    let r = c
+        .put(format!("{b}/mdb/doc1"))
+        .basic_auth("admin", Some("secret"))
+        .json(&json!({"v": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 201);
+    assert_eq!(with_auth(format!("{b}/mdb/doc1")).send().await.unwrap().status().as_u16(), 200);
+    let r = c
+        .post(format!("{b}/mdb/_bulk_docs"))
+        .basic_auth("admin", Some("secret"))
+        .json(&json!({"docs": [{"_id": "doc2"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 201);
+
+    let r = with_auth(format!("{b}/_node/_local/_prometheus")).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let ct = r.headers()["content-type"].to_str().unwrap().to_string();
+    assert!(ct.starts_with("text/plain"), "content-type: {ct}");
+    let body = r.text().await.unwrap();
+
+    // Every metric the nx Grafana dashboards query must be present.
+    for name in [
+        "couchdb_httpd_requests_total",
+        "couchdb_httpd_bulk_requests_total",
+        "couchdb_httpd_aborted_requests_total",
+        "couchdb_httpd_request_methods{method=\"PUT\"}",
+        "couchdb_request_time_seconds{quantile=\"0.5\"}",
+        "couchdb_request_time_seconds_sum",
+        "couchdb_request_time_seconds_count",
+        "couchdb_database_reads_total",
+        "couchdb_database_writes_total",
+        "couchdb_database_purges_total",
+        "couchdb_erlang_memory_bytes{memory_type=\"total\"}",
+        "couchdb_couch_replicator_jobs_running",
+        "couchdb_couch_replicator_jobs_pending",
+        "couchdb_couch_replicator_jobs_crashed",
+        "couchdb_couch_replicator_jobs_total",
+        "couchdb_couch_replicator_requests_total",
+        "couchdb_couch_replicator_responses_failure_total",
+        "couchdb_couch_replicator_checkpoints_total",
+        "couchdb_couch_replicator_checkpoints_failure_total",
+        "couchdb_couch_replicator_changes_read_failures_total",
+    ] {
+        assert!(body.contains(name), "missing metric {name} in:\n{body}");
+    }
+
+    // Counters are process-global (tests share the binary), so only assert
+    // they moved: the traffic above guarantees at least these floors.
+    let val = |metric: &str| -> f64 {
+        body.lines()
+            .find(|l| l.starts_with(metric) && l[metric.len()..].starts_with(' '))
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(-1.0)
+    };
+    assert!(val("couchdb_httpd_requests_total") >= 5.0);
+    assert!(val("couchdb_httpd_bulk_requests_total") >= 1.0);
+    assert!(val("couchdb_database_writes_total") >= 2.0);
+    assert!(val("couchdb_database_reads_total") >= 1.0);
+    assert!(val("couchdb_request_time_seconds_count") >= 5.0);
+    assert!(val("couchdb_request_time_seconds_sum") > 0.0);
+
+    // TYPE lines so Prometheus parses counters/gauges/summaries correctly.
+    for typ in [
+        "# TYPE couchdb_httpd_requests_total counter",
+        "# TYPE couchdb_request_time_seconds summary",
+        "# TYPE couchdb_couch_replicator_jobs_running gauge",
+        "# TYPE couchdb_erlang_memory_bytes gauge",
+    ] {
+        assert!(body.contains(typ), "missing: {typ}");
+    }
+
+    // Any node name resolves to this node, like upstream's _local.
+    let r = with_auth(format!("{b}/_node/nonode@nohost/_prometheus")).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+}

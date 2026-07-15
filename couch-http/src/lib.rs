@@ -7,11 +7,13 @@ pub mod api_changes;
 pub mod api_db;
 pub mod api_docs;
 pub mod api_mango;
+pub mod api_node;
 pub mod api_repl;
 pub mod api_root;
 pub mod auth;
 pub mod error;
 pub mod jsfilter;
+pub mod metrics;
 pub mod repl;
 pub mod state;
 pub mod ui;
@@ -60,6 +62,7 @@ pub fn router(app: App) -> Router {
         .route("/_replicate", post(api_repl::replicate))
         .route("/_utils", get(ui::utils))
         .route("/_utils/{*path}", get(ui::utils))
+        .route("/_node/{node}/_prometheus", get(api_node::prometheus))
         .route("/_scheduler/jobs", get(api_root::scheduler_jobs))
         .route("/_scheduler/docs", get(api_root::scheduler_docs))
         .route("/_scheduler/docs/_replicator", get(api_root::scheduler_docs))
@@ -143,6 +146,8 @@ pub fn router(app: App) -> Router {
             app.clone(),
             auth::require_admin,
         ))
+        // Outermost: sees every request, auth rejections included.
+        .layer(axum::middleware::from_fn(metrics::track))
         .with_state(app)
 }
 

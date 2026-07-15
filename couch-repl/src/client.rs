@@ -121,11 +121,20 @@ impl Endpoint {
 
     /// Send a request and map non-2xx statuses to errors.
     pub async fn send(&self, rb: RequestBuilder) -> Result<Response> {
-        let resp = rb.send().await.map_err(Error::Net)?;
+        crate::metrics::bump(&crate::metrics::REQUESTS);
+        let resp = match rb.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                crate::metrics::bump(&crate::metrics::RESPONSE_FAILURES);
+                return Err(Error::Net(e));
+            }
+        };
         let status = resp.status();
         if status.is_success() {
+            crate::metrics::bump(&crate::metrics::RESPONSES);
             return Ok(resp);
         }
+        crate::metrics::bump(&crate::metrics::RESPONSE_FAILURES);
         let url = resp.url().to_string();
         let retry_after = resp
             .headers()

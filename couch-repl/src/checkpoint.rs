@@ -200,7 +200,13 @@ impl Checkpointer {
 
         // Target first: a target checkpoint without a matching source one is
         // recovered via the target-side fallback in load().
-        let new_tgt_rev = put_local(&self.target, &doc, tgt_rev).await?;
+        let new_tgt_rev = match put_local(&self.target, &doc, tgt_rev).await {
+            Ok(rev) => rev,
+            Err(e) => {
+                crate::metrics::bump(&crate::metrics::CHECKPOINT_FAILURES);
+                return Err(e);
+            }
+        };
         let new_src_rev = if source_writable {
             match put_local(&self.source, &doc, src_rev).await {
                 Ok(rev) => Some(rev),
@@ -210,7 +216,10 @@ impl Checkpointer {
                     g.source_writable = false;
                     None
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    crate::metrics::bump(&crate::metrics::CHECKPOINT_FAILURES);
+                    return Err(e);
+                }
             }
         } else {
             None
@@ -223,6 +232,7 @@ impl Checkpointer {
         }
         g.history = history;
         g.last_written_seq = Some(seq.clone());
+        crate::metrics::bump(&crate::metrics::CHECKPOINTS);
         info!("recorded checkpoint at seq {seq}");
         Ok(())
     }

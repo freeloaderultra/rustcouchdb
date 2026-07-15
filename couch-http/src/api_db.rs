@@ -173,6 +173,7 @@ pub async fn purge(
     let _guard = lock_db.index_lock.lock().await;
     blocking(move || {
         let purged = dbh.with_writer(|w| w.purge_docs(&req))?;
+        crate::metrics::bump(&crate::metrics::DATABASE_PURGES);
         let touched: Vec<Vec<u8>> = purged
             .iter()
             .filter(|(_, revs)| !revs.is_empty())

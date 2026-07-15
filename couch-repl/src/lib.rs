@@ -10,6 +10,7 @@ pub mod error;
 pub mod fetch;
 pub mod gen;
 pub mod ids;
+pub mod metrics;
 pub mod pipeline;
 pub mod retry;
 pub mod revs_diff;

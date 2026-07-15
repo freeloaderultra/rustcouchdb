@@ -140,6 +140,7 @@ pub async fn bulk_get(
                 (None, _) => out_docs.push(not_found(rev)),
                 (Some(f), None) => match f.rev_tree.winner() {
                     Some(w) if !matches!(w.leaf, couch_store::revtree::RevVal::Leaf(l) if l.deleted) => {
+                        crate::metrics::bump(&crate::metrics::DATABASE_READS);
                         out_docs.push(json!({"ok": snap.doc_json(f, &w, &opts)?}))
                     }
                     _ => out_docs.push(not_found(None)),
@@ -157,6 +158,7 @@ pub async fn bulk_get(
                         out_docs.push(not_found(Some(r)));
                     } else {
                         for leaf in leaves {
+                            crate::metrics::bump(&crate::metrics::DATABASE_READS);
                             out_docs.push(json!({"ok": snap.doc_json(f, &leaf, &opts)?}));
                         }
                     }
@@ -352,6 +354,7 @@ async fn all_docs_inner(
                             row["doc"] = if fdi.deleted {
                                 Value::Null
                             } else {
+                                crate::metrics::bump(&crate::metrics::DATABASE_READS);
                                 snap.open_doc(id.as_bytes(), None, &opts)?.unwrap_or(Value::Null)
                             };
                         }
@@ -414,6 +417,7 @@ async fn all_docs_inner(
             let mut row = json!({"id": id, "key": id, "value": {"rev": rev}});
             if include_docs {
                 if let Some(w) = fdi.rev_tree.winner() {
+                    crate::metrics::bump(&crate::metrics::DATABASE_READS);
                     row["doc"] = snap.doc_json(&fdi, &w, &opts)?;
                 }
             }

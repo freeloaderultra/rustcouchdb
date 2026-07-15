@@ -148,6 +148,7 @@ impl ChangesReader {
                 Ok(()) => return Ok(()), // canceled
                 Err(Error::Canceled) => return Ok(()),
                 Err(e) if e.retryable() || e.status().is_some() => {
+                    crate::metrics::bump(&crate::metrics::CHANGES_READ_FAILURES);
                     failures += 1;
                     let delay = Duration::from_millis(500)
                         .saturating_mul(2u32.saturating_pow(failures.min(6)));
@@ -157,7 +158,10 @@ impl ChangesReader {
                         _ = tokio::time::sleep(delay.min(Duration::from_secs(30))) => {}
                     }
                 }
-                Err(e) => return Err(e),
+                Err(e) => {
+                    crate::metrics::bump(&crate::metrics::CHANGES_READ_FAILURES);
+                    return Err(e);
+                }
             }
         }
     }

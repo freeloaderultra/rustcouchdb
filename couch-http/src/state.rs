@@ -81,6 +81,7 @@ impl Database {
         w.commit()?;
         let seq = w.update_seq();
         drop(guard);
+        crate::metrics::bump(&crate::metrics::DATABASE_WRITES);
         self.refresh(seq)?;
         Ok(out)
     }
@@ -151,6 +152,7 @@ pub type App = Arc<ServerState>;
 
 impl ServerState {
     pub fn new(dir: PathBuf, admin: Option<(String, String)>, soft_delete_validator: bool) -> ServerState {
+        crate::metrics::init_start();
         let secret: [u8; 16] = rand::random();
         ServerState {
             server_uuid: gen_uuid(),

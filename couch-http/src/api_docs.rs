@@ -84,7 +84,10 @@ pub async fn doc_get(
             let mut out = Vec::new();
             for (pos, revid) in wanted {
                 match find_leaf(pos, &revid) {
-                    Some(leaf) => out.push(json!({"ok": snap.doc_json(&fdi, &leaf, &opts)?})),
+                    Some(leaf) => {
+                        crate::metrics::bump(&crate::metrics::DATABASE_READS);
+                        out.push(json!({"ok": snap.doc_json(&fdi, &leaf, &opts)?}))
+                    }
                     None => out.push(json!({"missing": docmod::rev_str(pos, &revid)})),
                 }
             }
@@ -110,6 +113,7 @@ pub async fn doc_get(
         let Some(doc) = doc else {
             return Err(ApiError::missing());
         };
+        crate::metrics::bump(&crate::metrics::DATABASE_READS);
         if rev.is_none() && doc.get("_deleted") == Some(&Value::Bool(true)) {
             return Err(ApiError::deleted());
         }
@@ -174,6 +178,7 @@ fn open_revs_multipart<'a>(
                 .unwrap_or(0)
         });
 
+        crate::metrics::bump(&crate::metrics::DATABASE_READS);
         let mut doc = snap.doc_json(fdi, &leaf, opts)?;
         // Attachment bytes for the parts, in _attachments order.
         let mut parts: Vec<(String, String, Vec<u8>)> = Vec::new();
@@ -509,7 +514,10 @@ fn modify_atts(
     let dbh = state.db(db)?;
     let snap = dbh.snapshot();
     let mut doc = match snap.open_doc(docid.as_bytes(), rev, &Default::default())? {
-        Some(d) if d.get("_deleted") != Some(&Value::Bool(true)) => d,
+        Some(d) if d.get("_deleted") != Some(&Value::Bool(true)) => {
+            crate::metrics::bump(&crate::metrics::DATABASE_READS);
+            d
+        }
         Some(_) | None => {
             if rev.is_some() {
                 return Err(ApiError::conflict());

@@ -99,6 +99,7 @@ fn change_row(snap: &Db, fdi: &FullDocInfo, opts: &ChangesOpts) -> couch_store::
             conflicts: opts.conflicts,
             ..Default::default()
         };
+        crate::metrics::bump(&crate::metrics::DATABASE_READS);
         Some(snap.doc_json(fdi, &winner, &dopts)?)
     } else {
         None
