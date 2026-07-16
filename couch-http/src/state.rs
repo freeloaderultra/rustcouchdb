@@ -136,6 +136,28 @@ impl Database {
     }
 }
 
+/// On-disk layout of the data directory.
+///
+/// `Flat` is rustcouchdb's native layout: `<dir>/<name>.couch`.
+///
+/// `CouchDb` serves a CouchDB 3.x node directory *in place*:
+/// `<dir>/shards/00000000-ffffffff/<name>.<timestamp>.couch`. An existing
+/// q=1 CouchDB volume can be mounted with zero migration — same files, same
+/// byte format — and switching the image back to Erlang CouchDB rolls back
+/// losslessly, including writes made in the meantime. (Databases *created*
+/// while running rustcouchdb are not registered in CouchDB's _dbs.couch
+/// shard map, so only those wouldn't reappear after a rollback.)
+/// `_dbs.couch`/`_nodes.couch` in the directory root are cluster
+/// bookkeeping and are ignored; `.shards/` (Erlang view indexes) too.
+#[derive(Debug)]
+enum Layout {
+    Flat,
+    CouchDb { range_dir: PathBuf },
+}
+
+/// The single full shard range a q=1 database lives in.
+const FULL_RANGE: &str = "00000000-ffffffff";
+
 pub struct ServerState {
     pub dir: PathBuf,
     pub admin: Option<(String, String)>,
@@ -145,6 +167,7 @@ pub struct ServerState {
     pub dbs: RwLock<HashMap<String, Arc<Database>>>,
     pub soft_delete_validator: bool,
     pub repl: crate::repl::ReplManager,
+    layout: Layout,
     uuid_counter: AtomicU64,
 }
 
@@ -154,6 +177,13 @@ impl ServerState {
     pub fn new(dir: PathBuf, admin: Option<(String, String)>, soft_delete_validator: bool) -> ServerState {
         crate::metrics::init_start();
         let secret: [u8; 16] = rand::random();
+        let layout = if dir.join("shards").is_dir() {
+            Layout::CouchDb {
+                range_dir: dir.join("shards").join(FULL_RANGE),
+            }
+        } else {
+            Layout::Flat
+        };
         ServerState {
             server_uuid: gen_uuid(),
             dir,
@@ -163,32 +193,102 @@ impl ServerState {
             dbs: RwLock::new(HashMap::new()),
             soft_delete_validator,
             repl: crate::repl::ReplManager::default(),
+            layout,
             uuid_counter: AtomicU64::new(0),
         }
     }
 
+    /// Where a NEW database with this name would be created. Databases that
+    /// already exist carry their own path (`Database.path`); in the CouchDb
+    /// layout that keeps an adopted shard file's original timestamp suffix
+    /// while new databases get a CouchDB-style creation-time suffix.
     pub fn db_path(&self, name: &str) -> String {
-        self.dir.join(format!("{name}.couch")).to_string_lossy().into_owned()
+        match &self.layout {
+            Layout::Flat => self.dir.join(format!("{name}.couch")),
+            Layout::CouchDb { range_dir } => {
+                range_dir.join(format!("{name}.{}.couch", now_secs()))
+            }
+        }
+        .to_string_lossy()
+        .into_owned()
     }
 
     /// Scan the data dir and open every database (server startup).
     pub fn open_all(&self) -> ApiResult<()> {
         std::fs::create_dir_all(&self.dir).map_err(couch_store::error::Error::Io)?;
         let mut dbs = self.dbs.write().unwrap();
-        for entry in std::fs::read_dir(&self.dir).map_err(couch_store::error::Error::Io)? {
-            let entry = entry.map_err(couch_store::error::Error::Io)?;
-            let fname = entry.file_name().to_string_lossy().into_owned();
-            if let Some(name) = fname.strip_suffix(".couch") {
-                if valid_db_name(name) {
-                    let path = entry.path().to_string_lossy().into_owned();
-                    match Database::open(name, path) {
-                        Ok(db) => {
-                            dbs.insert(name.to_string(), Arc::new(db));
-                        }
-                        Err(e) => {
-                            tracing::error!("cannot open {fname}: {} {}", e.error, e.reason);
+        let open_into = |name: &str, path: PathBuf, dbs: &mut HashMap<String, Arc<Database>>| {
+            match Database::open(name, path.to_string_lossy().into_owned()) {
+                Ok(db) => {
+                    dbs.insert(name.to_string(), Arc::new(db));
+                }
+                Err(e) => {
+                    tracing::error!("cannot open {}: {} {}", path.display(), e.error, e.reason);
+                }
+            }
+        };
+        match &self.layout {
+            Layout::Flat => {
+                for entry in std::fs::read_dir(&self.dir).map_err(couch_store::error::Error::Io)? {
+                    let entry = entry.map_err(couch_store::error::Error::Io)?;
+                    let fname = entry.file_name().to_string_lossy().into_owned();
+                    if let Some(name) = fname.strip_suffix(".couch") {
+                        if valid_db_name(name) {
+                            open_into(name, entry.path(), &mut dbs);
                         }
                     }
+                }
+            }
+            Layout::CouchDb { range_dir } => {
+                // q=1 only: a single full-range shard is the whole database.
+                // Any other range means the data is split across shards we
+                // cannot merge — refuse to start rather than serve slices.
+                let shards_dir = self.dir.join("shards");
+                for entry in std::fs::read_dir(&shards_dir).map_err(couch_store::error::Error::Io)? {
+                    let entry = entry.map_err(couch_store::error::Error::Io)?;
+                    let range = entry.file_name().to_string_lossy().into_owned();
+                    if entry.path().is_dir() && range != FULL_RANGE {
+                        return Err(ApiError::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "unsupported_shard_layout",
+                            format!(
+                                "shard range {range} found: only q=1 CouchDB data \
+                                 directories (a single {FULL_RANGE} range) can be \
+                                 served in place"
+                            ),
+                        ));
+                    }
+                }
+                tracing::info!(
+                    "serving CouchDB q=1 data directory in place: {}",
+                    range_dir.display()
+                );
+                // <name>.<creation-ts>.couch; a recreated db can leave
+                // several files for one name — CouchDB opens the one in its
+                // shard map, which for live data is the newest.
+                let mut newest: HashMap<String, (u64, PathBuf)> = HashMap::new();
+                if range_dir.is_dir() {
+                    for entry in std::fs::read_dir(range_dir).map_err(couch_store::error::Error::Io)? {
+                        let entry = entry.map_err(couch_store::error::Error::Io)?;
+                        let fname = entry.file_name().to_string_lossy().into_owned();
+                        let Some(stem) = fname.strip_suffix(".couch") else {
+                            continue;
+                        };
+                        let Some((name, ts)) = stem.rsplit_once('.') else {
+                            continue;
+                        };
+                        let Ok(ts) = ts.parse::<u64>() else { continue };
+                        if !valid_db_name(name) {
+                            continue;
+                        }
+                        let e = newest.entry(name.to_string()).or_insert((ts, entry.path()));
+                        if ts > e.0 {
+                            *e = (ts, entry.path());
+                        }
+                    }
+                }
+                for (name, (_, path)) in newest {
+                    open_into(&name, path, &mut dbs);
                 }
             }
         }
@@ -222,7 +322,11 @@ impl ServerState {
                 "The database could not be created, the file already exists.",
             ));
         }
-        let db = Arc::new(Database::create(name, self.db_path(name))?);
+        let path = self.db_path(name);
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(parent).map_err(couch_store::error::Error::Io)?;
+        }
+        let db = Arc::new(Database::create(name, path)?);
         dbs.insert(name.to_string(), db.clone());
         Ok(db)
     }
@@ -234,6 +338,29 @@ impl ServerState {
         };
         std::fs::remove_file(&db.path).map_err(couch_store::error::Error::Io)?;
         let _ = std::fs::remove_dir_all(couch_index::index::index_dir(&db.path));
+        // In an adopted CouchDB layout a recreated database can have left
+        // older <name>.<ts>.couch files behind; remove them too, or a
+        // restart would resurrect the newest leftover as the database.
+        if let Layout::CouchDb { range_dir } = &self.layout {
+            let entries = match std::fs::read_dir(range_dir) {
+                Ok(e) => e,
+                Err(_) => return Ok(()),
+            };
+            for entry in entries.flatten() {
+                let fname = entry.file_name().to_string_lossy().into_owned();
+                if let Some(ts) = fname
+                    .strip_prefix(&format!("{name}."))
+                    .and_then(|r| r.strip_suffix(".couch"))
+                {
+                    if ts.chars().all(|c| c.is_ascii_digit()) {
+                        let _ = std::fs::remove_file(entry.path());
+                        let _ = std::fs::remove_dir_all(couch_index::index::index_dir(
+                            &entry.path().to_string_lossy(),
+                        ));
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

@@ -829,6 +829,102 @@ async fn mango_indexes_live_in_design_docs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn couchdb_layout_served_in_place() {
+    // Author a database with the flat-layout server, then present the same
+    // file the way a CouchDB 3.x q=1 volume looks on disk and mount THAT.
+    let author = start(None, false).await;
+    let c = client();
+    let b = &author.base;
+    assert_eq!(jput(&c, &format!("{b}/src"), &json!({})).await.0, 201);
+    for i in 0..5 {
+        jput(&c, &format!("{b}/src/d{i}"), &json!({"n": i})).await;
+    }
+    let (s, _) = jpost(
+        &c,
+        &format!("{b}/src/_index"),
+        &json!({"index": {"fields": ["n"]}, "name": "by-n"}),
+    )
+    .await;
+    assert_eq!(s, 200);
+
+    let dir = tempfile::tempdir().unwrap();
+    let range = dir.path().join("shards").join("00000000-ffffffff");
+    std::fs::create_dir_all(&range).unwrap();
+    std::fs::copy(
+        author._dir.path().join("src.couch"),
+        range.join("mydb.1631712809.couch"),
+    )
+    .unwrap();
+    // An older leftover from a recreated db: the newer timestamp must win.
+    std::fs::copy(
+        author._dir.path().join("src.couch"),
+        range.join("mydb.1500000000.couch"),
+    )
+    .unwrap();
+    // Cluster bookkeeping in the root is ignored.
+    std::fs::write(dir.path().join("_dbs.couch"), b"not a real couch file").unwrap();
+
+    let app: App = Arc::new(ServerState::new(dir.path().to_path_buf(), None, false));
+    app.open_all().unwrap();
+    app.create_db("_replicator").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    *app.base_url.write().unwrap() = addr.to_string();
+    tokio::spawn(couch_http::serve(listener, app.clone(), std::future::pending()));
+    let b = format!("http://{addr}");
+
+    // The shard file serves as `mydb`, docs and Mango index included.
+    let (s, v) = jget(&c, &format!("{b}/_all_dbs")).await;
+    assert_eq!(s, 200);
+    assert!(v.as_array().unwrap().contains(&json!("mydb")), "{v}");
+    assert!(!v.as_array().unwrap().iter().any(|n| n == "_dbs"), "{v}");
+    let (s, v) = jget(&c, &format!("{b}/mydb/d3")).await;
+    assert_eq!((s, v["n"].as_i64().unwrap()), (200, 3));
+    let (_, r) = jpost(
+        &c,
+        &format!("{b}/mydb/_find"),
+        &json!({"selector": {"n": 2}}),
+    )
+    .await;
+    assert_eq!(r["docs"].as_array().unwrap().len(), 1);
+    assert!(r.get("warning").is_none(), "index must come along: {r}");
+
+    // Writes land in the same shard file (rollback to CouchDB keeps them).
+    assert_eq!(jput(&c, &format!("{b}/mydb/new"), &json!({"n": 99})).await.0, 201);
+
+    // New databases are created inside the range dir, CouchDB-style name.
+    assert_eq!(jput(&c, &format!("{b}/fresh"), &json!({})).await.0, 201);
+    let files: Vec<String> = std::fs::read_dir(&range)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        files.iter().any(|f| f.starts_with("fresh.") && f.ends_with(".couch")),
+        "{files:?}"
+    );
+
+    // Deleting removes every timestamp variant, not just the newest.
+    let r = c.delete(format!("{b}/mydb")).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let files: Vec<String> = std::fs::read_dir(&range)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !files.iter().any(|f| f.starts_with("mydb.")),
+        "leftover shard files resurrect the db on restart: {files:?}"
+    );
+
+    // q>1 layouts are refused loudly instead of serving partial data.
+    let dir2 = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir2.path().join("shards").join("00000000-7fffffff")).unwrap();
+    std::fs::create_dir_all(dir2.path().join("shards").join("80000000-ffffffff")).unwrap();
+    let app2: App = Arc::new(ServerState::new(dir2.path().to_path_buf(), None, false));
+    let err = app2.open_all().unwrap_err();
+    assert_eq!(err.error, "unsupported_shard_layout");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn prometheus_metrics() {
     let srv = start(Some("admin:secret"), false).await;
     let c = client();
