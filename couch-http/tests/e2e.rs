@@ -681,8 +681,10 @@ async fn purge_docs() {
     assert_eq!(v["purged"]["gone"].as_array().unwrap().len(), 1);
     let (s, v) = jget(&c, &format!("{b}/pdb/gone")).await;
     assert_eq!((s, v["reason"].as_str().unwrap()), (404, "missing")); // not "deleted"
+    // "keep" plus the _design/by-t doc backing the Mango index (CouchDB
+    // stores index definitions as design docs; so do we).
     let (_, v) = jget(&c, &format!("{b}/pdb/_all_docs")).await;
-    assert_eq!(v["total_rows"], json!(1));
+    assert_eq!(v["total_rows"], json!(2));
     let (_, v) = jget(&c, &format!("{b}/pdb/_changes")).await;
     let ids: Vec<&str> = v["results"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
     assert!(!ids.contains(&"gone"), "purged doc must vanish from _changes: {ids:?}");
@@ -690,9 +692,9 @@ async fn purge_docs() {
     let (_, r) = jpost(&c, &format!("{b}/pdb/_find"), &json!({"selector": {"t": "x"}})).await;
     let found: Vec<&str> = r["docs"].as_array().unwrap().iter().map(|d| d["_id"].as_str().unwrap()).collect();
     assert_eq!(found, vec!["keep"]);
-    // doc_count reflects the purge.
+    // doc_count reflects the purge ("keep" + the index's design doc).
     let (_, v) = jget(&c, &format!("{b}/pdb")).await;
-    assert_eq!(v["doc_count"], json!(1));
+    assert_eq!(v["doc_count"], json!(2));
 
     // Conflict branches: purge only the winning branch, loser takes over.
     let mk = |rev: &str, val: u32| json!({"_id": "cft", "_rev": rev, "v": val});
@@ -726,6 +728,104 @@ async fn purge_docs() {
     .await;
     assert_eq!(s, 201);
     assert_eq!(v["purged"]["cft"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mango_indexes_live_in_design_docs() {
+    let srv = start(None, false).await;
+    let c = client();
+    let b = &srv.base;
+    assert_eq!(jput(&c, &format!("{b}/idb"), &json!({})).await.0, 201);
+    for i in 0..8 {
+        let t = if i % 2 == 0 { "even" } else { "odd" };
+        jput(&c, &format!("{b}/idb/d{i}"), &json!({"t": t, "n": i})).await;
+    }
+
+    // POST _index stores the definition as a language:"query" design doc.
+    let (s, v) = jpost(
+        &c,
+        &format!("{b}/idb/_index"),
+        &json!({"index": {"fields": ["t"]}, "name": "by-t", "type": "json"}),
+    )
+    .await;
+    assert_eq!((s, v["result"].as_str().unwrap()), (200, "created"));
+    assert_eq!(v["id"], json!("_design/by-t"));
+    let (s, v) = jget(&c, &format!("{b}/idb/_design/by-t")).await;
+    assert_eq!((s, v["language"].as_str().unwrap()), (200, "query"));
+    assert_eq!(
+        v["views"]["by-t"]["options"]["def"]["fields"],
+        json!(["t"])
+    );
+    // Same definition again → exists, no duplicate.
+    let (s, v) = jpost(
+        &c,
+        &format!("{b}/idb/_index"),
+        &json!({"index": {"fields": ["t"]}, "name": "by-t", "type": "json"}),
+    )
+    .await;
+    assert_eq!((s, v["result"].as_str().unwrap()), (200, "exists"));
+
+    // First _find materializes the .fidx and uses the index.
+    let q = json!({"selector": {"t": "even"}, "execution_stats": true});
+    let (_, r) = jpost(&c, &format!("{b}/idb/_find"), &q).await;
+    assert_eq!(r["docs"].as_array().unwrap().len(), 4);
+    assert!(r.get("warning").is_none(), "index should be used: {r}");
+    assert_eq!(r["execution_stats"]["total_keys_examined"], json!(4));
+    assert!(r["execution_stats"]["execution_time_ms"].as_f64().unwrap() > 0.0);
+
+    // The production failure: the .couch file is migrated but the external
+    // .indexes directory is lost. The definition must survive in the ddoc
+    // and the next _find must rebuild the materialization, not full-scan
+    // forever.
+    let idxdir = srv._dir.path().join("idb.couch.indexes");
+    assert!(idxdir.join("by-t.fidx").exists());
+    std::fs::remove_dir_all(&idxdir).unwrap();
+    let (_, v) = jget(&c, &format!("{b}/idb/_index")).await;
+    let names: Vec<&str> = v["indexes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"by-t"), "ddoc-defined index lost: {names:?}");
+    let (_, r) = jpost(&c, &format!("{b}/idb/_find"), &q).await;
+    assert_eq!(r["docs"].as_array().unwrap().len(), 4);
+    assert!(r.get("warning").is_none(), "index should be rebuilt: {r}");
+    assert_eq!(r["execution_stats"]["total_keys_examined"], json!(4));
+    assert!(idxdir.join("by-t.fidx").exists(), "materialization rebuilt");
+
+    // A CouchDB-written Mango ddoc (hashed id, replicated in) is honored too.
+    let ddoc = json!({
+        "language": "query",
+        "views": {"idx-n": {
+            "map": {"fields": {"n": "asc"}, "partial_filter_selector": {}},
+            "reduce": "_count",
+            "options": {"def": {"fields": ["n"]}},
+        }},
+    });
+    let (s, _) = jput(&c, &format!("{b}/idb/_design/abc123hash"), &ddoc).await;
+    assert_eq!(s, 201);
+    let (_, r) = jpost(
+        &c,
+        &format!("{b}/idb/_find"),
+        &json!({"selector": {"n": {"$gte": 6}}, "execution_stats": true}),
+    )
+    .await;
+    assert_eq!(r["docs"].as_array().unwrap().len(), 2);
+    assert!(r.get("warning").is_none(), "replicated ddoc index unused: {r}");
+
+    // DELETE _index tombstones the ddoc and removes the materialization.
+    let r = c
+        .delete(format!("{b}/idb/_index/_design/by-t/json/by-t"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(jget(&c, &format!("{b}/idb/_design/by-t")).await.0, 404);
+    assert!(!idxdir.join("by-t.fidx").exists());
+    let (_, r) = jpost(&c, &format!("{b}/idb/_find"), &q).await;
+    assert_eq!(r["docs"].as_array().unwrap().len(), 4);
+    assert!(r.get("warning").is_some(), "by-t should be gone: {r}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

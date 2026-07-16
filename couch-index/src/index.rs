@@ -173,44 +173,56 @@ impl Index {
         let mut id_removes: Vec<Term> = Vec::new();
         let mut last_seq = self.update_seq;
 
-        // Collect batches first (fold borrows the file immutably), then
-        // apply. Memory stays bounded by flushing every BATCH docs.
-        let mut pending: Vec<(Vec<u8>, u64, Option<Term>)> = Vec::new();
-        db.fold_changes(self.update_seq, |fdi| {
-            let new_key = if fdi.deleted {
-                None
-            } else {
-                let doc = match fdi.rev_tree.winner() {
-                    Some(w) => db.doc_json(&fdi, &w, &Default::default())?,
-                    None => return Ok(ControlFlow::Continue(())),
-                };
-                let matches_pfs = pfs.as_ref().map(|s| s.matches(&doc)).unwrap_or(true);
-                if !matches_pfs {
+        // Collect one batch at a time (the fold borrows the file immutably,
+        // add_remove needs it mutably), apply it, and re-seek from the last
+        // applied seq. Memory stays bounded by BATCH even for a cold build
+        // over millions of changes.
+        let mut since = self.update_seq;
+        loop {
+            let mut pending: Vec<(Vec<u8>, u64, Option<Term>)> = Vec::with_capacity(BATCH);
+            db.fold_changes(since, |fdi| {
+                let new_key = if fdi.deleted {
                     None
                 } else {
-                    let mut cols = Vec::with_capacity(self.def.fields.len());
-                    let mut complete = true;
-                    for f in &self.def.fields {
-                        match couch_mango::get_field(&doc, f) {
-                            Some(v) => cols.push(v.clone()),
-                            None => {
-                                complete = false;
-                                break;
+                    let doc = match fdi.rev_tree.winner() {
+                        Some(w) => db.doc_json(&fdi, &w, &Default::default())?,
+                        None => return Ok(ControlFlow::Continue(())),
+                    };
+                    let matches_pfs = pfs.as_ref().map(|s| s.matches(&doc)).unwrap_or(true);
+                    if !matches_pfs {
+                        None
+                    } else {
+                        let mut cols = Vec::with_capacity(self.def.fields.len());
+                        let mut complete = true;
+                        for f in &self.def.fields {
+                            match couch_mango::get_field(&doc, f) {
+                                Some(v) => cols.push(v.clone()),
+                                None => {
+                                    complete = false;
+                                    break;
+                                }
                             }
                         }
+                        if complete {
+                            Some(keys::btree_key(&cols, &fdi.id))
+                        } else {
+                            None
+                        }
                     }
-                    if complete {
-                        Some(keys::btree_key(&cols, &fdi.id))
-                    } else {
-                        None
-                    }
-                }
-            };
-            pending.push((fdi.id.clone(), fdi.update_seq, new_key));
-            Ok(ControlFlow::Continue(()))
-        })?;
-
-        for chunk in pending.chunks(BATCH) {
+                };
+                pending.push((fdi.id.clone(), fdi.update_seq, new_key));
+                Ok(if pending.len() >= BATCH {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                })
+            })?;
+            if pending.is_empty() {
+                break;
+            }
+            let full_batch = pending.len() >= BATCH;
+            since = pending.last().map(|(_, s, _)| *s).unwrap_or(since);
+            let chunk = &pending[..];
             // look up existing entries for these ids
             let id_keys: Vec<Term> = chunk
                 .iter()
@@ -256,6 +268,9 @@ impl Index {
                 std::mem::take(&mut id_inserts),
                 std::mem::take(&mut id_removes),
             )?;
+            if !full_batch {
+                break;
+            }
         }
 
         if last_seq != self.update_seq || processed > 0 {
@@ -373,6 +388,58 @@ impl Index {
         self.file.sync()?;
         Ok(n)
     }
+}
+
+/// One index definition known to the database: either declared by a
+/// `language: "query"` design doc (CouchDB's source of truth — survives
+/// file-level migration and replication) and/or present as a materialized
+/// .fidx file. `index` is None for a ddoc definition that has not been
+/// built yet.
+pub struct Defined {
+    pub ddoc_id: Option<String>,
+    pub def: IndexDef,
+    pub index: Option<Index>,
+}
+
+/// Union of design-doc definitions and .fidx files, matched by definition.
+/// A .fidx whose definition matches a ddoc is that ddoc's materialization;
+/// a .fidx without a ddoc still works (legacy standalone index). Duplicate
+/// ddoc definitions collapse to the first.
+pub fn discover(dir: &Path, db: &Db) -> Result<Vec<Defined>> {
+    let mut files = list(dir)?;
+    let mut out: Vec<Defined> = Vec::new();
+    for d in crate::ddoc::scan(db)? {
+        let dj = d.def.def_json();
+        if out.iter().any(|o| o.ddoc_id.is_some() && o.def.def_json() == dj) {
+            continue;
+        }
+        let pos = files.iter().position(|f| f.def.def_json() == dj);
+        out.push(Defined {
+            ddoc_id: Some(d.ddoc_id),
+            def: d.def,
+            index: pos.map(|p| files.remove(p)),
+        });
+    }
+    for f in files {
+        out.push(Defined {
+            ddoc_id: None,
+            def: f.def.clone(),
+            index: Some(f),
+        });
+    }
+    out.sort_by(|a, b| a.def.name.cmp(&b.def.name));
+    Ok(out)
+}
+
+/// Build the .fidx for a definition that has none yet. If the definition's
+/// name is already taken by a different index file, falls back to the
+/// content-hash name.
+pub fn materialize(dir: &Path, def: &IndexDef, source_uuid: &str) -> Result<Index> {
+    let mut def = def.clone();
+    if dir.join(format!("{}.fidx", def.name)).exists() {
+        def.name = def.auto_name();
+    }
+    Index::create(dir, def, source_uuid)
 }
 
 pub fn list(dir: &Path) -> Result<Vec<Index>> {

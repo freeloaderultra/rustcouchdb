@@ -146,6 +146,17 @@ impl Db {
         })
     }
 
+    /// Fold live+deleted docs by id starting at `start_id` (inclusive).
+    pub fn fold_docs_from<F>(&self, start_id: &[u8], mut f: F) -> Result<()>
+    where
+        F: FnMut(FullDocInfo) -> Result<ControlFlow<()>>,
+    {
+        let start = Term::Bin(start_id.to_vec());
+        btree::fold(&self.file, &self.id_root, Some(&start), &mut |k, v| {
+            f(Self::fdi_from_id_kv(k, v)?)
+        })
+    }
+
     pub fn fold_changes<F>(&self, since: u64, mut f: F) -> Result<()>
     where
         F: FnMut(FullDocInfo) -> Result<ControlFlow<()>>,

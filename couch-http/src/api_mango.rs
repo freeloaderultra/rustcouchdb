@@ -80,33 +80,45 @@ pub async fn index_create(
     let _guard = lock_db.index_lock.lock().await;
     blocking(move || {
         let dir = index::index_dir(&dbh.path);
-        let existing = index::list(&dir)?;
+        let snap = dbh.snapshot();
         // Same name or same definition → "exists".
-        for e in &existing {
+        for e in index::discover(&dir, &snap)? {
             if e.def.name == def.name
                 || (e.def.fields == def.fields
                     && e.def.partial_filter_selector == def.partial_filter_selector)
             {
+                let id = e
+                    .ddoc_id
+                    .unwrap_or_else(|| format!("_design/{}", e.def.name));
                 return Ok(Json(json!({
                     "result": "exists",
-                    "id": format!("_design/{}", e.def.name),
+                    "id": id,
                     "name": e.def.name,
                 }))
                 .into_response());
             }
         }
-        let snap = dbh.snapshot();
+        // The definition lives in a design doc (CouchDB-compatible), so it
+        // survives file-level data migration and replicates with the data.
+        // The .fidx materialization is built lazily by the first _find.
         let name = def.name.clone();
-        index::Index::create(&dir, def, &snap.header.uuid_str())?;
-        Ok((
-            StatusCode::OK,
-            Json(json!({
-                "result": "created",
-                "id": format!("_design/{name}"),
-                "name": name,
-            })),
-        )
-            .into_response())
+        let ddoc_id = format!("_design/{name}");
+        let body = couch_index::ddoc::ddoc_body(&ddoc_id, &def);
+        let outcome = dbh.with_writer(|w| w.save_doc(&body, None))?;
+        match outcome {
+            couch_store::writer::SaveOutcome::Ok { .. } => Ok((
+                StatusCode::OK,
+                Json(json!({
+                    "result": "created",
+                    "id": ddoc_id,
+                    "name": name,
+                })),
+            )
+                .into_response()),
+            couch_store::writer::SaveOutcome::Error { error, reason } => {
+                Err(ApiError::from_save(&error, &reason))
+            }
+        }
     })
 }
 
@@ -120,20 +132,22 @@ pub async fn index_list(State(state): State<App>, Path(db): Path<String>) -> Api
             "type": "special",
             "def": {"fields": [{"_id": "asc"}]},
         })];
-        for idx in index::list(&dir)? {
-            let fields: Vec<Value> = idx
+        let snap = dbh.snapshot();
+        for d in index::discover(&dir, &snap)? {
+            let fields: Vec<Value> = d
                 .def
                 .fields
                 .iter()
                 .map(|f| json!({f.clone(): "asc"}))
                 .collect();
             let mut def = json!({"fields": fields});
-            if let Some(pfs) = &idx.def.partial_filter_selector {
+            if let Some(pfs) = &d.def.partial_filter_selector {
                 def["partial_filter_selector"] = pfs.clone();
             }
             indexes.push(json!({
-                "ddoc": format!("_design/{}", idx.def.name),
-                "name": idx.def.name,
+                "ddoc": d.ddoc_id
+                    .unwrap_or_else(|| format!("_design/{}", d.def.name)),
+                "name": d.def.name,
                 "type": "json",
                 "def": def,
             }));
@@ -150,12 +164,38 @@ pub async fn index_delete(
     let lock_db = dbh.clone();
     let _guard = lock_db.index_lock.lock().await;
     blocking(move || {
-        let _ = ddoc;
-        let path = index::index_dir(&dbh.path).join(format!("{name}.fidx"));
-        if !path.exists() {
+        let dir = index::index_dir(&dbh.path);
+        let snap = dbh.snapshot();
+        let want_ddoc = if ddoc.starts_with("_design/") {
+            ddoc.clone()
+        } else {
+            format!("_design/{ddoc}")
+        };
+        let found = index::discover(&dir, &snap)?.into_iter().find(|d| {
+            d.def.name == name
+                && d.ddoc_id
+                    .as_deref()
+                    .map(|id| id == want_ddoc)
+                    // legacy standalone .fidx: listed under _design/<name>
+                    .unwrap_or(want_ddoc == format!("_design/{name}"))
+        });
+        let Some(d) = found else {
             return Err(ApiError::not_found(format!("no such index: {name}")));
+        };
+        if let Some(id) = &d.ddoc_id {
+            // tombstone the defining design doc
+            if let Some(doc) = snap.open_doc(id.as_bytes(), None, &Default::default())? {
+                let del = json!({
+                    "_id": id,
+                    "_rev": doc["_rev"],
+                    "_deleted": true,
+                });
+                dbh.with_writer(|w| w.save_doc(&del, None))?;
+            }
         }
-        std::fs::remove_file(&path).map_err(couch_store::error::Error::Io)?;
+        if let Some(idx) = &d.index {
+            std::fs::remove_file(&idx.path).map_err(couch_store::error::Error::Io)?;
+        }
         Ok(Json(json!({"ok": true})).into_response())
     })
 }
@@ -165,31 +205,59 @@ pub async fn find(
     Path(db): Path<String>,
     body: bytes::Bytes,
 ) -> ApiResult<Response> {
+    let t0 = std::time::Instant::now();
     let v = parse_json(&body)?;
     let want_stats = matches!(v.get("execution_stats"), Some(Value::Bool(true)));
     let dbh = state.db(&db)?;
-    // Serialize against other _find/_index calls: index files are opened RW
-    // and updated before the query.
-    let lock_db = dbh.clone();
-    let _guard = lock_db.index_lock.lock().await;
+    let fq = FindQuery::parse(&v)?;
+    let selector = couch_mango::Selector::compile(&fq.selector)
+        .map_err(|e| ApiError::bad_request(format!("invalid selector: {e}")))?;
+
+    // Serialize index-file writes: choosing, materializing and updating the
+    // index happen under the per-db lock. The scan itself runs after the
+    // lock is dropped — index reads are preads against an append-only file,
+    // so a concurrent updater can't disturb the tree this query walks, and
+    // one slow full scan no longer blocks every other Mango request.
+    let guard = dbh.index_lock.lock().await;
+    let dbh1 = dbh.clone();
+    let (snap, chosen) = blocking(|| -> ApiResult<_> {
+        let snap = dbh1.snapshot();
+        let dir = index::index_dir(&dbh1.path);
+        let mut defined = index::discover(&dir, &snap)?;
+        let mut chosen = find::choose(&mut defined, &fq)?;
+        let picked = match chosen.defined.as_deref_mut() {
+            Some(d) => {
+                let mut idx = match d.index.take() {
+                    Some(i) => i,
+                    // defined by a design doc but never built: build it now
+                    None => index::materialize(&dir, &d.def, &snap.header.uuid_str())?,
+                };
+                idx.update(&snap)?;
+                let plan = chosen.plan.take().ok_or_else(|| {
+                    ApiError::bad_request("chosen index without a plan")
+                })?;
+                Some((idx, plan))
+            }
+            None => None,
+        };
+        Ok((snap, picked))
+    })?;
+    drop(guard);
+
     blocking(move || {
-        let fq = FindQuery::parse(&v)?;
-        let selector = couch_mango::Selector::compile(&fq.selector)
-            .map_err(|e| ApiError::bad_request(format!("invalid selector: {e}")))?;
-        let snap = dbh.snapshot();
-        let dir = index::index_dir(&dbh.path);
-        let mut indexes = index::list(&dir)?;
-        let mut chosen = find::choose(&mut indexes, &fq)?;
-        if let Some(idx) = chosen.index.as_deref_mut() {
-            idx.update(&snap)?;
-        }
         let mut docs = Vec::new();
-        let stats = find::execute(&snap, &chosen, &fq, &selector, &mut |doc| {
-            docs.push(doc);
-            Ok(())
-        })?;
+        let stats = find::execute(
+            &snap,
+            chosen.as_ref().map(|(i, p)| (i, p)),
+            &fq,
+            &selector,
+            &mut |doc| {
+                docs.push(doc);
+                Ok(())
+            },
+        )?;
         let mut resp = json!({"docs": docs, "bookmark": "nil"});
-        if chosen.index.is_none() {
+        if chosen.is_none() {
             resp["warning"] = json!(
                 "No matching index found, create an index to optimize query time."
             );
@@ -200,7 +268,7 @@ pub async fn find(
                 "total_docs_examined": stats.docs_examined,
                 "total_quorum_docs_examined": 0,
                 "results_returned": stats.results,
-                "execution_time_ms": 0.0,
+                "execution_time_ms": t0.elapsed().as_secs_f64() * 1000.0,
             });
         }
         Ok(Json(resp).into_response())
@@ -218,9 +286,10 @@ pub async fn explain(
     let _guard = lock_db.index_lock.lock().await;
     blocking(move || {
         let fq = FindQuery::parse(&v)?;
+        let snap = dbh.snapshot();
         let dir = index::index_dir(&dbh.path);
-        let mut indexes = index::list(&dir)?;
-        let chosen = find::choose(&mut indexes, &fq)?;
+        let mut defined = index::discover(&dir, &snap)?;
+        let chosen = find::choose(&mut defined, &fq)?;
         let mut out = find::explain(&dbh.path, &chosen, &fq);
         out["dbname"] = json!(dbh.name);
         Ok(Json(out).into_response())

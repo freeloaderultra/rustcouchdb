@@ -62,38 +62,42 @@ impl FindQuery {
 }
 
 pub struct Chosen<'a> {
-    pub index: Option<&'a mut Index>,
+    pub defined: Option<&'a mut crate::index::Defined>,
     pub plan: Option<planner::IndexPlan>,
     pub rejected: Vec<(String, String)>,
 }
 
-/// mango_cursor:choose — rank usable indexes by equality prefix, then
-/// constrained prefix, then fewer columns.
+/// mango_cursor:choose — rank usable index definitions by equality prefix,
+/// then constrained prefix, then fewer columns; ties prefer an index that is
+/// already materialized over one that would have to be built first.
 pub fn choose<'a>(
-    indexes: &'a mut [Index],
+    defined: &'a mut [crate::index::Defined],
     query: &FindQuery,
 ) -> Result<Chosen<'a>> {
     let mut rejected = Vec::new();
-    let mut best: Option<(usize, (usize, usize, std::cmp::Reverse<usize>))> = None;
+    let mut best: Option<(usize, (usize, usize, std::cmp::Reverse<usize>, bool))> = None;
     let mut best_plan: Option<planner::IndexPlan> = None;
-    for (i, idx) in indexes.iter().enumerate() {
+    for (i, d) in defined.iter().enumerate() {
         if let Some(want) = &query.use_index {
-            if &idx.def.name != want {
+            let ddoc_matches = d.ddoc_id.as_deref().is_some_and(|id| {
+                id == want || id.strip_prefix("_design/") == Some(want.as_str())
+            });
+            if &d.def.name != want && !ddoc_matches {
                 continue;
             }
         }
-        match planner::plan_index(&idx.def.fields, &query.selector, &query.sort_fields) {
-            Err(e) => rejected.push((idx.def.name.clone(), e)),
-            Ok(None) => rejected.push((idx.def.name.clone(), "not usable for this selector/sort".into())),
+        match planner::plan_index(&d.def.fields, &query.selector, &query.sort_fields) {
+            Err(e) => rejected.push((d.def.name.clone(), e)),
+            Ok(None) => rejected.push((d.def.name.clone(), "not usable for this selector/sort".into())),
             Ok(Some(plan)) => {
                 // A partial index may only serve selectors that imply its
                 // filter; conservatively require the query selector to
                 // contain it verbatim — otherwise post-filtering could hide
                 // matching docs that the index never stored.
-                if let Some(pfs) = &idx.def.partial_filter_selector {
+                if let Some(pfs) = &d.def.partial_filter_selector {
                     if !selector_implies(&query.selector, pfs) {
                         rejected.push((
-                            idx.def.name.clone(),
+                            d.def.name.clone(),
                             "partial index filter not implied by selector".into(),
                         ));
                         continue;
@@ -102,7 +106,8 @@ pub fn choose<'a>(
                 let rank = (
                     plan.eq_prefix,
                     plan.constrained_prefix,
-                    std::cmp::Reverse(idx.def.fields.len()),
+                    std::cmp::Reverse(d.def.fields.len()),
+                    d.index.is_some(),
                 );
                 if best.as_ref().map(|(_, r)| rank > *r).unwrap_or(true) {
                     best = Some((i, rank));
@@ -113,7 +118,7 @@ pub fn choose<'a>(
     }
     match best {
         Some((i, _)) => Ok(Chosen {
-            index: Some(&mut indexes[i]),
+            defined: Some(&mut defined[i]),
             plan: best_plan,
             rejected,
         }),
@@ -130,7 +135,7 @@ pub fn choose<'a>(
                 ));
             }
             Ok(Chosen {
-                index: None,
+                defined: None,
                 plan: None,
                 rejected,
             })
@@ -168,10 +173,13 @@ pub struct FindStats {
     pub results: u64,
 }
 
-/// Execute the query, streaming result docs to `emit`.
+/// Execute the query, streaming result docs to `emit`. Takes the (already
+/// updated) index by reference rather than the Chosen borrow so callers can
+/// release any index-file lock before the scan — reads are pure preads on
+/// an append-only file and never conflict with concurrent index writers.
 pub fn execute<F>(
     db: &Db,
-    chosen: &Chosen<'_>,
+    index: Option<(&Index, &planner::IndexPlan)>,
     query: &FindQuery,
     selector: &Selector,
     emit: &mut F,
@@ -205,8 +213,8 @@ where
         Ok(ControlFlow::Continue(()))
     };
 
-    match (&chosen.index, &chosen.plan) {
-        (Some(idx), Some(plan)) => {
+    match index {
+        Some((idx, plan)) => {
             let (start, end, end_inclusive) = planner::scan_bounds(&plan.ranges);
             idx.scan(&start, &end, end_inclusive, query.descending, &mut |docid| {
                 stats.scanned += 1;
@@ -216,10 +224,11 @@ where
                 process(doc, &mut stats)
             })?;
         }
-        _ => {
+        None => {
             // full scan fallback (like _all_docs-backed _find)
             db.fold_docs(|fdi| {
-                if fdi.deleted {
+                // mango never yields design docs from a full scan
+                if fdi.deleted || fdi.id.starts_with(b"_design/") {
                     return Ok(ControlFlow::Continue(()));
                 }
                 stats.scanned += 1;
@@ -263,7 +272,21 @@ fn insert_path(out: &mut Map<String, Value>, field: &str, v: Value) {
 }
 
 pub fn explain(db_path: &str, chosen: &Chosen<'_>, query: &FindQuery) -> Value {
-    let index_info = chosen.index.as_ref().map(|i| i.info());
+    let index_info = chosen.defined.as_ref().map(|d| {
+        let mut info = match &d.index {
+            Some(i) => i.info(),
+            None => json!({
+                "name": d.def.name,
+                "fields": d.def.fields,
+                "partial_filter_selector": d.def.partial_filter_selector,
+                "state": "unbuilt (materializes on first _find)",
+            }),
+        };
+        if let Some(id) = &d.ddoc_id {
+            info["ddoc"] = json!(id);
+        }
+        info
+    });
     let bounds = chosen.plan.as_ref().map(|p| {
         let (start, end, incl) = planner::scan_bounds(&p.ranges);
         json!({

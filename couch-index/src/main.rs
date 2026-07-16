@@ -166,28 +166,44 @@ fn run(cmd: Cmd) -> Result<()> {
             let selector = couch_mango::Selector::compile(&fq.selector)
                 .map_err(|e| Error::BadRequest(format!("invalid selector: {e}")))?;
             let database = Db::open(&db)?;
-            let mut indexes = index::list(&dir_for(&db, &dir))?;
-            let mut chosen = find::choose(&mut indexes, &fq)?;
+            let dir = dir_for(&db, &dir);
+            let mut defined = index::discover(&dir, &database)?;
+            let mut chosen = find::choose(&mut defined, &fq)?;
             if explain {
                 println_json(&find::explain(&db, &chosen, &fq));
                 return Ok(());
             }
-            if !stale {
-                if let Some(idx) = chosen.index.as_deref_mut() {
-                    idx.update(&database)?;
+            let picked = match chosen.defined.as_deref_mut() {
+                Some(d) => {
+                    let fresh = d.index.is_none();
+                    let mut idx = match d.index.take() {
+                        Some(i) => i,
+                        None => index::materialize(&dir, &d.def, &database.header.uuid_str())?,
+                    };
+                    // --stale can't serve a never-built index: build it once
+                    if !stale || fresh {
+                        idx.update(&database)?;
+                    }
+                    Some((idx, chosen.plan.take().expect("chosen index has a plan")))
                 }
-            }
-            let run_stats = find::execute(&database, &chosen, &fq, &selector, &mut |doc| {
-                println_json(&doc);
-                Ok(())
-            })?;
+                None => None,
+            };
+            let run_stats = find::execute(
+                &database,
+                picked.as_ref().map(|(i, p)| (i, p)),
+                &fq,
+                &selector,
+                &mut |doc| {
+                    println_json(&doc);
+                    Ok(())
+                },
+            )?;
             if stats {
                 eprintln!(
                     "index={} rows_scanned={} docs_examined={} results={}",
-                    chosen
-                        .index
+                    picked
                         .as_ref()
-                        .map(|i| i.def.name.clone())
+                        .map(|(i, _)| i.def.name.clone())
                         .unwrap_or_else(|| "<full-scan>".into()),
                     run_stats.scanned,
                     run_stats.docs_examined,

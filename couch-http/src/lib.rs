@@ -111,6 +111,11 @@ pub fn router(app: App) -> Router {
             "/{db}/_index/{ddoc}/json/{name}",
             delete(api_mango::index_delete),
         )
+        // CouchDB also accepts the _design/-prefixed ddoc id here
+        .route(
+            "/{db}/_index/_design/{ddoc}/json/{name}",
+            delete(api_mango::index_delete),
+        )
         .route(
             "/{db}/_local/{*docid}",
             get(api_docs::local_get)
