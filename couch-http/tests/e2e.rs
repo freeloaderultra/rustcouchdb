@@ -829,6 +829,170 @@ async fn mango_indexes_live_in_design_docs() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spatial_index_serves_bbox_intersection() {
+    let s = start(None, false).await;
+    let c = client();
+    let b = &s.base;
+    assert_eq!(jput(&c, &format!("{b}/geo"), &json!({})).await.0, 201);
+
+    // nxguide-shaped field docs: boundingBox.topLeft = (maxLat, minLon),
+    // boundingBox.bottomRight = (minLat, maxLon), on a 10x6 grid near 48N 9E.
+    let mut fields: Vec<(String, f64, f64, f64, f64)> = Vec::new(); // (id, w, s, e, n)
+    for i in 0..60 {
+        let w = 9.0 + (i % 10) as f64 * 0.05;
+        let so = 48.0 + (i / 10) as f64 * 0.05;
+        let (e, n) = (w + 0.02, so + 0.02);
+        let id = format!("field-{i:02}");
+        let doc = json!({
+            "db": {"DocType": "field"},
+            "name": id,
+            "boundingBox": {
+                "topLeft": {"latitude": n, "longitude": w},
+                "bottomRight": {"latitude": so, "longitude": e},
+            },
+        });
+        assert_eq!(jput(&c, &format!("{b}/geo/{id}"), &doc).await.0, 201);
+        fields.push((id, w, so, e, n));
+    }
+    // noise: another doctype, a field with no bbox, one with a junk bbox
+    jput(&c, &format!("{b}/geo/vehicle-1"), &json!({"db": {"DocType": "vehicle"}})).await;
+    jput(&c, &format!("{b}/geo/field-nobox"), &json!({"db": {"DocType": "field"}})).await;
+    jput(
+        &c,
+        &format!("{b}/geo/field-junk"),
+        &json!({"db": {"DocType": "field"}, "boundingBox": {
+            "topLeft": {"latitude": 48.0, "longitude": "not-a-number"},
+            "bottomRight": {"latitude": 47.9, "longitude": 9.1}}}),
+    )
+    .await;
+
+    // the four stored-edge paths, in west/south/east/north order
+    let (st, v) = jpost(
+        &c,
+        &format!("{b}/geo/_index"),
+        &json!({"type": "spatial", "name": "fields-bbox", "index": {"fields": [
+            "boundingBox.topLeft.longitude",
+            "boundingBox.bottomRight.latitude",
+            "boundingBox.bottomRight.longitude",
+            "boundingBox.topLeft.latitude",
+        ]}}),
+    )
+    .await;
+    assert_eq!(st, 200, "{v}");
+    assert_eq!(v["result"], "created");
+    // same definition again → exists
+    let (_, v2) = jpost(
+        &c,
+        &format!("{b}/geo/_index"),
+        &json!({"type": "spatial", "index": {"fields": [
+            "boundingBox.topLeft.longitude",
+            "boundingBox.bottomRight.latitude",
+            "boundingBox.bottomRight.longitude",
+            "boundingBox.topLeft.latitude",
+        ]}}),
+    )
+    .await;
+    assert_eq!(v2["result"], "exists", "{v2}");
+    let (_, l) = jget(&c, &format!("{b}/geo/_index")).await;
+    let listed = l["indexes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["name"] == "fields-bbox")
+        .unwrap_or_else(|| panic!("spatial index not listed: {l}"));
+    assert_eq!(listed["type"], "spatial");
+
+    // the exact selector nxguide's GetFields builds for a viewport
+    let (qw, qs, qe, qn) = (9.12, 48.08, 9.31, 48.22);
+    let viewport = json!({
+        "db.DocType": "field",
+        "boundingBox.topLeft.latitude": {"$gte": qs},
+        "boundingBox.bottomRight.latitude": {"$lte": qn},
+        "boundingBox.topLeft.longitude": {"$lte": qe},
+        "boundingBox.bottomRight.longitude": {"$gte": qw},
+    });
+    let mut expected: Vec<&str> = fields
+        .iter()
+        .filter(|(_, w, so, e, n)| *w <= qe && *e >= qw && *so <= qn && *n >= qs)
+        .map(|(id, ..)| id.as_str())
+        .collect();
+    expected.sort();
+    assert!(expected.len() > 5, "test grid should intersect the viewport");
+
+    // _explain picks the spatial index
+    let (_, ex) = jpost(
+        &c,
+        &format!("{b}/geo/_explain"),
+        &json!({"selector": viewport}),
+    )
+    .await;
+    assert_eq!(ex["index"]["name"], "fields-bbox", "{ex}");
+    assert_eq!(ex["index"]["type"], "spatial", "{ex}");
+
+    let q = json!({"selector": viewport, "limit": 1000, "execution_stats": true});
+    let (_, r) = jpost(&c, &format!("{b}/geo/_find"), &q).await;
+    let mut got: Vec<&str> = r["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_str().unwrap())
+        .collect();
+    got.sort();
+    assert_eq!(got, expected, "spatial _find diverges from brute force");
+    assert!(r.get("warning").is_none(), "used an index: {r}");
+    // the index pruned: far fewer docs touched than the 62 field docs
+    let examined = r["execution_stats"]["total_docs_examined"].as_u64().unwrap();
+    assert!(examined < 45, "no spatial pruning happened: {examined} docs examined");
+
+    // a selector missing one bbox clause can't use the spatial index but
+    // must stay correct (json-index/full-scan fallback)
+    let partial = json!({
+        "db.DocType": "field",
+        "boundingBox.topLeft.latitude": {"$gte": qs},
+        "boundingBox.bottomRight.latitude": {"$lte": qn},
+        "boundingBox.topLeft.longitude": {"$lte": qe},
+    });
+    let mut expected_partial: Vec<&str> = fields
+        .iter()
+        .filter(|(_, w, so, _, n)| *w <= qe && *so <= qn && *n >= qs)
+        .map(|(id, ..)| id.as_str())
+        .collect();
+    expected_partial.sort();
+    let (_, r) = jpost(
+        &c,
+        &format!("{b}/geo/_find"),
+        &json!({"selector": partial, "limit": 1000}),
+    )
+    .await;
+    let mut got: Vec<&str> = r["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_str().unwrap())
+        .collect();
+    got.sort();
+    assert_eq!(got, expected_partial);
+
+    // delete the index; the viewport query still answers via full scan
+    let del = c
+        .delete(format!("{b}/geo/_index/_design/fields-bbox/json/fields-bbox"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status().as_u16(), 200);
+    let (_, r) = jpost(&c, &format!("{b}/geo/_find"), &q).await;
+    let mut got: Vec<&str> = r["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_str().unwrap())
+        .collect();
+    got.sort();
+    assert_eq!(got, expected);
+    assert!(r.get("warning").is_some(), "index should be gone: {r}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn couchdb_layout_served_in_place() {
     // Author a database with the flat-layout server, then present the same
     // file the way a CouchDB 3.x q=1 volume looks on disk and mount THAT.

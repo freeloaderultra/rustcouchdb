@@ -61,22 +61,31 @@ impl FindQuery {
     }
 }
 
+/// How a chosen index will be scanned.
+pub enum Plan {
+    View(planner::IndexPlan),
+    Spatial(planner::SpatialPlan),
+}
+
 pub struct Chosen<'a> {
     pub defined: Option<&'a mut crate::index::Defined>,
-    pub plan: Option<planner::IndexPlan>,
+    pub plan: Option<Plan>,
     pub rejected: Vec<(String, String)>,
 }
 
 /// mango_cursor:choose — rank usable index definitions by equality prefix,
 /// then constrained prefix, then fewer columns; ties prefer an index that is
-/// already materialized over one that would have to be built first.
+/// already materialized over one that would have to be built first. A usable
+/// spatial index outranks JSON indexes: its usability already implies the
+/// selector constrains a bbox, and no btree prefix can serve that region.
 pub fn choose<'a>(
     defined: &'a mut [crate::index::Defined],
     query: &FindQuery,
 ) -> Result<Chosen<'a>> {
+    type Rank = (bool, usize, usize, std::cmp::Reverse<usize>, bool);
     let mut rejected = Vec::new();
-    let mut best: Option<(usize, (usize, usize, std::cmp::Reverse<usize>, bool))> = None;
-    let mut best_plan: Option<planner::IndexPlan> = None;
+    let mut best: Option<(usize, Rank)> = None;
+    let mut best_plan: Option<Plan> = None;
     for (i, d) in defined.iter().enumerate() {
         if let Some(want) = &query.use_index {
             let ddoc_matches = d.ddoc_id.as_deref().is_some_and(|id| {
@@ -86,10 +95,39 @@ pub fn choose<'a>(
                 continue;
             }
         }
-        match planner::plan_index(&d.def.fields, &query.selector, &query.sort_fields) {
+        let planned = match d.def.kind {
+            crate::index::IndexKind::Json => {
+                planner::plan_index(&d.def.fields, &query.selector, &query.sort_fields).map(
+                    |opt| {
+                        opt.map(|plan| {
+                            let rank = (
+                                false,
+                                plan.eq_prefix,
+                                plan.constrained_prefix,
+                                std::cmp::Reverse(d.def.fields.len()),
+                                d.index.is_some(),
+                            );
+                            (Plan::View(plan), rank)
+                        })
+                    },
+                )
+            }
+            crate::index::IndexKind::Spatial => {
+                planner::plan_spatial(&d.def.fields, &query.selector, &query.sort_fields).map(
+                    |opt| {
+                        opt.map(|plan| {
+                            let rank =
+                                (true, 4, 4, std::cmp::Reverse(4), d.index.is_some());
+                            (Plan::Spatial(plan), rank)
+                        })
+                    },
+                )
+            }
+        };
+        match planned {
             Err(e) => rejected.push((d.def.name.clone(), e)),
             Ok(None) => rejected.push((d.def.name.clone(), "not usable for this selector/sort".into())),
-            Ok(Some(plan)) => {
+            Ok(Some((plan, rank))) => {
                 // A partial index may only serve selectors that imply its
                 // filter; conservatively require the query selector to
                 // contain it verbatim — otherwise post-filtering could hide
@@ -103,12 +141,6 @@ pub fn choose<'a>(
                         continue;
                     }
                 }
-                let rank = (
-                    plan.eq_prefix,
-                    plan.constrained_prefix,
-                    std::cmp::Reverse(d.def.fields.len()),
-                    d.index.is_some(),
-                );
                 if best.as_ref().map(|(_, r)| rank > *r).unwrap_or(true) {
                     best = Some((i, rank));
                     best_plan = Some(plan);
@@ -179,7 +211,7 @@ pub struct FindStats {
 /// an append-only file and never conflict with concurrent index writers.
 pub fn execute<F>(
     db: &Db,
-    index: Option<(&Index, &planner::IndexPlan)>,
+    index: Option<(&Index, &Plan)>,
     query: &FindQuery,
     selector: &Selector,
     emit: &mut F,
@@ -214,7 +246,7 @@ where
     };
 
     match index {
-        Some((idx, plan)) => {
+        Some((idx, Plan::View(plan))) => {
             let (start, end, end_inclusive) = planner::scan_bounds(&plan.ranges);
             idx.scan(&start, &end, end_inclusive, query.descending, &mut |docid| {
                 stats.scanned += 1;
@@ -223,6 +255,45 @@ where
                 };
                 process(doc, &mut stats)
             })?;
+        }
+        Some((idx, Plan::Spatial(plan))) => {
+            // The covering's ranges are disjoint by construction, so no
+            // dedup is needed; every candidate goes through the same full
+            // selector post-filter, which makes false positives harmless.
+            let mut done = false;
+            for cover in crate::spatial::covering(&plan.query) {
+                let cell = crate::keys::Bound::Val(json!(cover.key));
+                let (end, end_inclusive) = if cover.subtree {
+                    (
+                        crate::keys::Bound::Val(json!(crate::spatial::subtree_end(&cover.key))),
+                        false,
+                    )
+                } else {
+                    (cell.clone(), true)
+                };
+                idx.scan(
+                    std::slice::from_ref(&cell),
+                    std::slice::from_ref(&end),
+                    end_inclusive,
+                    false,
+                    &mut |docid| {
+                        stats.scanned += 1;
+                        let Some(doc) = db.open_doc(docid, None, &Default::default())? else {
+                            return Ok(ControlFlow::Continue(()));
+                        };
+                        match process(doc, &mut stats)? {
+                            ControlFlow::Break(()) => {
+                                done = true;
+                                Ok(ControlFlow::Break(()))
+                            }
+                            c => Ok(c),
+                        }
+                    },
+                )?;
+                if done {
+                    break;
+                }
+            }
         }
         None => {
             // full scan fallback (like _all_docs-backed _find)
@@ -277,6 +348,10 @@ pub fn explain(db_path: &str, chosen: &Chosen<'_>, query: &FindQuery) -> Value {
             Some(i) => i.info(),
             None => json!({
                 "name": d.def.name,
+                "type": match d.def.kind {
+                    crate::index::IndexKind::Json => "json",
+                    crate::index::IndexKind::Spatial => "spatial",
+                },
                 "fields": d.def.fields,
                 "partial_filter_selector": d.def.partial_filter_selector,
                 "state": "unbuilt (materializes on first _find)",
@@ -287,13 +362,25 @@ pub fn explain(db_path: &str, chosen: &Chosen<'_>, query: &FindQuery) -> Value {
         }
         info
     });
-    let bounds = chosen.plan.as_ref().map(|p| {
-        let (start, end, incl) = planner::scan_bounds(&p.ranges);
-        json!({
-            "start_key": start.iter().map(bound_json).collect::<Vec<_>>(),
-            "end_key": end.iter().map(bound_json).collect::<Vec<_>>(),
-            "end_inclusive": incl,
-        })
+    let bounds = chosen.plan.as_ref().map(|p| match p {
+        Plan::View(p) => {
+            let (start, end, incl) = planner::scan_bounds(&p.ranges);
+            json!({
+                "start_key": start.iter().map(bound_json).collect::<Vec<_>>(),
+                "end_key": end.iter().map(bound_json).collect::<Vec<_>>(),
+                "end_inclusive": incl,
+            })
+        }
+        Plan::Spatial(p) => {
+            let inf = |x: f64| if x.is_finite() { json!(x) } else { json!(null) };
+            json!({
+                "query_bbox": {
+                    "west": inf(p.query.w), "south": inf(p.query.s),
+                    "east": inf(p.query.e), "north": inf(p.query.n),
+                },
+                "btree_ranges": crate::spatial::covering(&p.query).len(),
+            })
+        }
     });
     json!({
         "dbname": db_path,

@@ -19,11 +19,21 @@ use std::path::{Path, PathBuf};
 const VERSION: i64 = 1;
 const BATCH: usize = 4000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexKind {
+    /// Mango JSON index: one btree key per doc from the field columns.
+    Json,
+    /// Bounding-box index: fields name the [west, south, east, north]
+    /// paths; keys are quadtree cells (see the spatial module).
+    Spatial,
+}
+
 #[derive(Clone, Debug)]
 pub struct IndexDef {
     pub name: String,
     pub fields: Vec<String>,
     pub partial_filter_selector: Option<Value>,
+    pub kind: IndexKind,
 }
 
 impl IndexDef {
@@ -35,6 +45,11 @@ impl IndexDef {
         );
         if let Some(pfs) = &self.partial_filter_selector {
             m.insert("partial_filter_selector".into(), pfs.clone());
+        }
+        // Json indexes keep their historical def_json (existing .fidx
+        // files must keep matching their design docs byte-for-byte).
+        if self.kind == IndexKind::Spatial {
+            m.insert("type".into(), json!("spatial"));
         }
         Value::Object(m)
     }
@@ -112,6 +127,10 @@ impl Index {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
+        let kind = match def_json.get("type").and_then(|t| t.as_str()) {
+            Some("spatial") => IndexKind::Spatial,
+            _ => IndexKind::Json,
+        };
         Ok(Index {
             path: path.to_path_buf(),
             def: IndexDef {
@@ -121,6 +140,7 @@ impl Index {
                     .get("partial_filter_selector")
                     .filter(|v| !v.is_null() && !v.as_object().is_some_and(|o| o.is_empty()))
                     .cloned(),
+                kind,
             },
             source_uuid: String::from_utf8_lossy(tup[3].as_bin()?).into_owned(),
             update_seq: tup[4].as_u64()?,
@@ -192,22 +212,7 @@ impl Index {
                     if !matches_pfs {
                         None
                     } else {
-                        let mut cols = Vec::with_capacity(self.def.fields.len());
-                        let mut complete = true;
-                        for f in &self.def.fields {
-                            match couch_mango::get_field(&doc, f) {
-                                Some(v) => cols.push(v.clone()),
-                                None => {
-                                    complete = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if complete {
-                            Some(keys::btree_key(&cols, &fdi.id))
-                        } else {
-                            None
-                        }
+                        doc_key(&self.def, &doc, &fdi.id)
                     }
                 };
                 pending.push((fdi.id.clone(), fdi.update_seq, new_key));
@@ -332,6 +337,10 @@ impl Index {
     pub fn info(&self) -> Value {
         json!({
             "name": self.def.name,
+            "type": match self.def.kind {
+                IndexKind::Json => "json",
+                IndexKind::Spatial => "spatial",
+            },
             "fields": self.def.fields,
             "partial_filter_selector": self.def.partial_filter_selector,
             "rows": self.row_count(),
@@ -387,6 +396,49 @@ impl Index {
         self.file.write_header(&header)?;
         self.file.sync()?;
         Ok(n)
+    }
+}
+
+/// The btree key a document contributes to an index, or None when the doc
+/// doesn't belong in it. Both kinds require every indexed path to exist —
+/// Mango's positive conditions can't match a doc missing the field, so
+/// such docs are unreachable through this index anyway.
+fn doc_key(def: &IndexDef, doc: &Value, docid: &[u8]) -> Option<Term> {
+    match def.kind {
+        IndexKind::Json => {
+            let mut cols = Vec::with_capacity(def.fields.len());
+            for f in &def.fields {
+                cols.push(couch_mango::get_field(doc, f)?.clone());
+            }
+            Some(keys::btree_key(&cols, docid))
+        }
+        IndexKind::Spatial => {
+            let mut edges = [0.0f64; 4];
+            let mut numeric = true;
+            for (i, f) in def.fields.iter().enumerate() {
+                let v = couch_mango::get_field(doc, f)?;
+                match v.as_f64() {
+                    Some(x) => edges[i] = x,
+                    None => {
+                        numeric = false;
+                        break;
+                    }
+                }
+            }
+            let cell = if numeric {
+                crate::spatial::quadkey(&crate::spatial::Rect {
+                    w: edges[0],
+                    s: edges[1],
+                    e: edges[2],
+                    n: edges[3],
+                })
+            } else {
+                // present but non-numeric values still collate against
+                // range operators — keep the doc reachable via the junk cell
+                crate::spatial::JUNK.to_string()
+            };
+            Some(keys::btree_key(&[json!(cell)], docid))
+        }
     }
 }
 

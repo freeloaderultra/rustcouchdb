@@ -33,6 +33,9 @@ enum Cmd {
         /// Only index docs matching this Mango selector (JSON)
         #[arg(long)]
         partial_filter_selector: Option<String>,
+        /// Bounding-box index: fields must be the four west,south,east,north paths
+        #[arg(long)]
+        spatial: bool,
         /// Index directory (default: <db>.indexes)
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -100,6 +103,7 @@ fn run(cmd: Cmd) -> Result<()> {
             fields,
             name,
             partial_filter_selector,
+            spatial,
             dir,
         } => {
             let database = Db::open(&db)?;
@@ -110,10 +114,20 @@ fn run(cmd: Cmd) -> Result<()> {
                 ),
                 None => None,
             };
+            if spatial && fields.len() != 4 {
+                return Err(Error::BadRequest(
+                    "a spatial index needs exactly 4 fields: west,south,east,north paths".into(),
+                ));
+            }
             let mut def = index::IndexDef {
                 name: String::new(),
                 fields,
                 partial_filter_selector: pfs,
+                kind: if spatial {
+                    index::IndexKind::Spatial
+                } else {
+                    index::IndexKind::Json
+                },
             };
             def.name = name.unwrap_or_else(|| def.auto_name());
             let mut idx =

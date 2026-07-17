@@ -9,7 +9,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use couch_index::find::{self, FindQuery};
-use couch_index::index::{self, IndexDef};
+use couch_index::index::{self, IndexDef, IndexKind};
 use serde_json::{json, Value};
 
 /// Normalize the `fields` of an index definition: ["a"], [{"a":"asc"}].
@@ -50,17 +50,24 @@ pub async fn index_create(
     let idx = v
         .get("index")
         .ok_or_else(|| ApiError::bad_request("Missing required key: index"))?;
-    if let Some(t) = v.get("type").and_then(|t| t.as_str()) {
-        if t != "json" {
+    let kind = match v.get("type").and_then(|t| t.as_str()) {
+        None | Some("json") => IndexKind::Json,
+        Some("spatial") => IndexKind::Spatial,
+        Some(t) => {
             return Err(ApiError::bad_request(format!(
-                "unsupported index type `{t}` (only \"json\")"
+                "unsupported index type `{t}` (only \"json\" or \"spatial\")"
             )));
         }
-    }
+    };
     let fields = normalize_fields(
         idx.get("fields")
             .ok_or_else(|| ApiError::bad_request("Missing required key: fields"))?,
     )?;
+    if kind == IndexKind::Spatial && fields.len() != 4 {
+        return Err(ApiError::bad_request(
+            "a spatial index needs exactly 4 fields: the west, south, east, north paths",
+        ));
+    }
     let pfs = idx.get("partial_filter_selector").cloned().filter(|s| {
         !matches!(s, Value::Object(o) if o.is_empty()) && !s.is_null()
     });
@@ -68,6 +75,7 @@ pub async fn index_create(
         name: String::new(),
         fields,
         partial_filter_selector: pfs,
+        kind,
     };
     def.name = v
         .get("name")
@@ -83,10 +91,7 @@ pub async fn index_create(
         let snap = dbh.snapshot();
         // Same name or same definition → "exists".
         for e in index::discover(&dir, &snap)? {
-            if e.def.name == def.name
-                || (e.def.fields == def.fields
-                    && e.def.partial_filter_selector == def.partial_filter_selector)
-            {
+            if e.def.name == def.name || e.def.def_json() == def.def_json() {
                 let id = e
                     .ddoc_id
                     .unwrap_or_else(|| format!("_design/{}", e.def.name));
@@ -134,13 +139,16 @@ pub async fn index_list(State(state): State<App>, Path(db): Path<String>) -> Api
         })];
         let snap = dbh.snapshot();
         for d in index::discover(&dir, &snap)? {
-            let fields: Vec<Value> = d
-                .def
-                .fields
-                .iter()
-                .map(|f| json!({f.clone(): "asc"}))
-                .collect();
-            let mut def = json!({"fields": fields});
+            // json defs list CouchDB-style [{field: "asc"}]; spatial defs
+            // keep the plain 4-path array (order is the definition).
+            let mut def = match d.def.kind {
+                IndexKind::Json => json!({
+                    "fields": d.def.fields.iter()
+                        .map(|f| json!({f.clone(): "asc"}))
+                        .collect::<Vec<Value>>()
+                }),
+                IndexKind::Spatial => json!({"fields": d.def.fields}),
+            };
             if let Some(pfs) = &d.def.partial_filter_selector {
                 def["partial_filter_selector"] = pfs.clone();
             }
@@ -148,7 +156,10 @@ pub async fn index_list(State(state): State<App>, Path(db): Path<String>) -> Api
                 "ddoc": d.ddoc_id
                     .unwrap_or_else(|| format!("_design/{}", d.def.name)),
                 "name": d.def.name,
-                "type": "json",
+                "type": match d.def.kind {
+                    IndexKind::Json => "json",
+                    IndexKind::Spatial => "spatial",
+                },
                 "def": def,
             }));
         }

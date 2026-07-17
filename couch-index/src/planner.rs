@@ -314,6 +314,62 @@ pub fn plan_index(
     }))
 }
 
+/// Scan plan for a spatial index: the query rectangle implied by the
+/// selector's range clauses on the four stored-edge paths.
+pub struct SpatialPlan {
+    pub query: crate::spatial::Rect,
+}
+
+/// Usability + query-rect extraction for a spatial index over stored edge
+/// paths [west, south, east, north]. A stored bbox intersects the query
+/// rect iff  W <= q.e && E >= q.w && S <= q.n && N >= q.s  — exactly the
+/// four range clauses Mango callers write — so:
+///   q.e = upper bound on W,  q.w = lower bound on E,
+///   q.n = upper bound on S,  q.s = lower bound on N.
+/// Bounds the selector doesn't provide (or non-numeric ones) widen to ±∞;
+/// the walk only ever needs a superset, the full selector post-filters.
+pub fn plan_spatial(
+    paths: &[String],
+    sel: &Value,
+    sort_fields: &[String],
+) -> Result<Option<SpatialPlan>, String> {
+    if paths.len() != 4 {
+        return Ok(None);
+    }
+    // Index rows exist only for docs with all four paths present, so the
+    // selector must pin all four — same coverage rule as JSON indexes.
+    if !sort_fields.is_empty() || !has_required_fields(sel, paths) {
+        return Ok(None);
+    }
+    let mut ranges = Vec::with_capacity(4);
+    for p in paths {
+        match column_range(sel, p) {
+            Some(r) => ranges.push(r),
+            None => return Err(format!("selector range for {p} is empty")),
+        }
+    }
+    let num = |b: &Bound, low: bool| -> f64 {
+        match b {
+            Bound::Val(v) if v.is_number() => v.as_f64().unwrap_or(0.0),
+            _ if low => f64::NEG_INFINITY,
+            _ => f64::INFINITY,
+        }
+    };
+    let query = crate::spatial::Rect {
+        e: num(&ranges[0].high, false), // upper bound on stored west
+        n: num(&ranges[1].high, false), // upper bound on stored south
+        w: num(&ranges[2].low, true),   // lower bound on stored east
+        s: num(&ranges[3].low, true),   // lower bound on stored north
+    };
+    // With no finite edge the index degenerates to a full scan of itself —
+    // let a JSON index (or the fallback) take the query instead.
+    if !query.w.is_finite() && !query.s.is_finite() && !query.e.is_finite() && !query.n.is_finite()
+    {
+        return Ok(None);
+    }
+    Ok(Some(SpatialPlan { query }))
+}
+
 /// mango_idx_view:start_key / end_key — composite scan bounds.
 /// start: take keys while columns are constrained from below; stop after the
 /// first non-eq column. end: same from above, with Max padding.
