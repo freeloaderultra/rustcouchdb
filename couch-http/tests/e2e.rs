@@ -1275,6 +1275,36 @@ async fn gzip_transport_negotiation() {
         .unwrap();
     assert_eq!(r.headers().get("content-encoding").unwrap(), "gzip");
 
+    // Protobuf attachments are treated as compressible: identity without
+    // Accept-Encoding, gzip (inflating to identical bytes) with it.
+    let pb: Vec<u8> = (0..2000u32)
+        .flat_map(|i| [0x09, (i % 7) as u8, 0, 0, 0, 0, 0, 0, 0x40])
+        .collect();
+    let r = c
+        .put(format!("{b}/gz/blobdoc/blob.data"))
+        .header("content-type", "application/protobuf")
+        .body(pb.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 201);
+    let r = c.get(format!("{b}/gz/blobdoc/blob.data")).send().await.unwrap();
+    assert!(r.headers().get("content-encoding").is_none());
+    assert_eq!(r.bytes().await.unwrap().as_ref(), &pb[..]);
+    let r = c
+        .get(format!("{b}/gz/blobdoc/blob.data"))
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.headers().get("content-encoding").unwrap(), "gzip");
+    assert_eq!(r.headers().get("content-type").unwrap(), "application/protobuf");
+    let gz_att = r.bytes().await.unwrap();
+    assert!(gz_att.len() < pb.len());
+    let mut inflated = Vec::new();
+    GzDecoder::new(&gz_att[..]).read_to_end(&mut inflated).unwrap();
+    assert_eq!(&inflated[..], &pb[..]);
+
     // Unsupported request encodings are rejected like stock chttpd.
     let r = c
         .post(format!("{b}/gz/_bulk_docs"))

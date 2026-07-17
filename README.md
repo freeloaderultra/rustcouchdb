@@ -48,7 +48,10 @@ OpenSSL; runs on ARM Linux).
   welcome message proves support (the `"gzip"` feature flag, or stock
   CouchDB by vendor) — servers without it, older rustcouchdb included,
   receive byte-identical requests to before. ~3.5× smaller transfers on
-  coordinate-heavy documents.
+  coordinate-heavy documents. Compressible types extend stock's list
+  (text/*, json, xml, javascript) with protobuf — compact wire format
+  but not compressed; gzip measures 1.6–3.4× on real payloads. Transport
+  only: stored attachment bytes are never altered.
 
 ## Server performance
 

@@ -91,6 +91,9 @@ fn compressible_type(ct: Option<&HeaderValue>) -> bool {
         || mime.contains("json")
         || mime.contains("xml")
         || mime.contains("javascript")
+        // Protobuf wire format is compact but not compressed (repeated tags,
+        // back-to-back doubles): gzip measures 1.6-3.4x on real payloads.
+        || mime.contains("protobuf")
 }
 
 pub async fn compress_response(req: Request, next: Next) -> Response {
@@ -165,6 +168,8 @@ mod tests {
         assert!(compressible_type(Some(&hv("text/html"))));
         assert!(compressible_type(Some(&hv("image/svg+xml"))));
         assert!(compressible_type(Some(&hv("application/javascript"))));
+        assert!(compressible_type(Some(&hv("application/protobuf"))));
+        assert!(compressible_type(Some(&hv("application/x-protobuf"))));
         assert!(!compressible_type(Some(&hv("image/jpeg"))));
         assert!(!compressible_type(Some(&hv("application/octet-stream"))));
         assert!(!compressible_type(None));
