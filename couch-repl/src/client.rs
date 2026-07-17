@@ -5,6 +5,8 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
@@ -17,6 +19,10 @@ pub struct Endpoint {
     headers: HeaderMap,
     pub retry: RetryPolicy,
     request_timeout: Duration,
+    /// Whether this server is known to inflate `Content-Encoding: gzip`
+    /// request bodies (see [`Endpoint::detect_gzip_support`]). Off until
+    /// proven, so unknown/old servers always get identity bodies.
+    gzip_requests: Arc<AtomicBool>,
 }
 
 impl Endpoint {
@@ -80,7 +86,57 @@ impl Endpoint {
             headers,
             retry,
             request_timeout: Duration::from_secs(timeout_secs),
+            gzip_requests: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Probe the server's welcome message and enable gzip request bodies when
+    /// the peer is known to inflate them: rustcouchdb advertising the "gzip"
+    /// feature, or stock Apache CouchDB (chttpd inflates gzipped bodies).
+    /// Anything else — critically, older rustcouchdb containers, which don't
+    /// inflate — keeps identity bodies, so this is backward compatible by
+    /// construction. A failed probe leaves compression off; it never fails
+    /// the job.
+    pub async fn detect_gzip_support(&self) {
+        let mut url = self.db_url.clone();
+        if let Ok(mut path) = url.path_segments_mut() {
+            path.pop();
+        }
+        let rb = self
+            .request(Method::GET, url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .timeout(self.request_timeout);
+        let supported = match self.send(rb).await {
+            Ok(resp) => match resp.json::<serde_json::Value>().await {
+                Ok(welcome) => welcome_supports_gzip(&welcome),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+        self.gzip_requests.store(supported, Ordering::Relaxed);
+        if supported {
+            tracing::info!("{}: gzip request bodies enabled", self.label);
+        }
+    }
+
+    pub fn gzip_requests(&self) -> bool {
+        self.gzip_requests.load(Ordering::Relaxed)
+    }
+
+    /// Compress `body` for this endpoint if it accepts gzip request bodies.
+    /// Returns the (possibly compressed) body and whether it was compressed.
+    pub fn maybe_gzip(&self, body: Bytes) -> (Bytes, bool) {
+        if !self.gzip_requests() || body.len() < 256 {
+            return (body, false);
+        }
+        use std::io::Write;
+        let mut enc = flate2::write::GzEncoder::new(
+            Vec::with_capacity(body.len() / 3),
+            flate2::Compression::fast(),
+        );
+        // Writing to a Vec cannot fail.
+        enc.write_all(&body).expect("gzip to Vec");
+        (Bytes::from(enc.finish().expect("gzip finish")), true)
     }
 
     /// Database name (last path segment), for display.
@@ -212,6 +268,7 @@ impl Endpoint {
     }
 
     /// POST with a pre-serialized JSON body (zero re-serialization path).
+    /// The body is gzipped when the server is known to accept it.
     pub async fn post_raw<T: DeserializeOwned>(
         &self,
         segments: &[&str],
@@ -221,14 +278,18 @@ impl Endpoint {
     ) -> Result<T> {
         let url = self.url(segments);
         let what = format!("POST {}/{}", self.label, segments.join("/"));
+        let (body, gzipped) = self.maybe_gzip(body);
         with_retry(&self.retry, &what, || async {
-            let rb = self
+            let mut rb = self
                 .request(Method::POST, url.clone())
                 .header(reqwest::header::ACCEPT, "application/json")
                 .query(query)
                 .header(CONTENT_TYPE, "application/json")
                 .body(body.clone())
                 .timeout(timeout);
+            if gzipped {
+                rb = rb.header(reqwest::header::CONTENT_ENCODING, "gzip");
+            }
             let resp = self.send(rb).await?;
             resp.json::<T>().await.map_err(Error::Net)
         })
@@ -330,4 +391,51 @@ fn percent_decode(s: &str) -> String {
 fn base64_std(data: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+/// Decide from a welcome (`GET /`) body whether the server inflates gzip
+/// request bodies: rustcouchdb advertising the "gzip" feature, or stock
+/// Apache CouchDB. Servers advertising neither (old rustcouchdb among them)
+/// must keep receiving identity bodies.
+fn welcome_supports_gzip(welcome: &serde_json::Value) -> bool {
+    if let Some(features) = welcome.get("features").and_then(|f| f.as_array()) {
+        if features.iter().any(|f| f.as_str() == Some("gzip")) {
+            return true;
+        }
+    }
+    welcome
+        .get("vendor")
+        .and_then(|v| v.get("name"))
+        .and_then(|n| n.as_str())
+        .is_some_and(|name| name.contains("Apache Software Foundation"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::welcome_supports_gzip;
+    use serde_json::json;
+
+    #[test]
+    fn gzip_probe_decisions() {
+        // New rustcouchdb: feature flag present.
+        assert!(welcome_supports_gzip(&json!({
+            "couchdb": "Welcome", "version": "3.5.1",
+            "features": ["access-ready", "gzip", "scheduler"],
+            "vendor": {"name": "rustcouchdb", "variant": "rust"},
+        })));
+        // Old rustcouchdb: no flag, non-Apache vendor -> identity bodies.
+        assert!(!welcome_supports_gzip(&json!({
+            "couchdb": "Welcome", "version": "3.5.1",
+            "features": ["access-ready", "scheduler"],
+            "vendor": {"name": "rustcouchdb", "variant": "rust"},
+        })));
+        // Stock CouchDB 3.x: chttpd inflates gzip request bodies.
+        assert!(welcome_supports_gzip(&json!({
+            "couchdb": "Welcome", "version": "3.3.3",
+            "features": ["access-ready", "partitioned", "pluggable-storage-engines", "reshard", "scheduler"],
+            "vendor": {"name": "The Apache Software Foundation"},
+        })));
+        // Unknown server: stay identity.
+        assert!(!welcome_supports_gzip(&json!({"ok": true})));
+    }
 }

@@ -11,6 +11,7 @@ pub mod api_node;
 pub mod api_repl;
 pub mod api_root;
 pub mod auth;
+pub mod compress;
 pub mod error;
 pub mod jsfilter;
 pub mod metrics;
@@ -151,6 +152,10 @@ pub fn router(app: App) -> Router {
             app.clone(),
             auth::require_admin,
         ))
+        // Gzip negotiation wraps auth so inflated bodies reach the handlers
+        // and even auth rejections compress when the client asked for it.
+        .layer(axum::middleware::from_fn(compress::decompress_request))
+        .layer(axum::middleware::from_fn(compress::compress_response))
         // Outermost: sees every request, auth rejections included.
         .layer(axum::middleware::from_fn(metrics::track))
         .with_state(app)

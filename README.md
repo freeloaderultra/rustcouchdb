@@ -34,6 +34,16 @@ OpenSSL; runs on ARM Linux).
   quadtree instead of a full scan. The definition lives in a
   `language: "query"` design doc section that stock CouchDB ignores, so
   databases carrying spatial indexes still replicate to Erlang peers.
+- HTTP gzip, negotiated per request (stock CouchDB compresses neither
+  direction of replication traffic). Responses compress only for clients
+  sending `Accept-Encoding: gzip` (`feed=continuous` always stays identity
+  so heartbeats flow); `Content-Encoding: gzip` request bodies are
+  inflated like chttpd does. `couch-repl` compresses `_bulk_docs`,
+  `_bulk_get` and compressible-attachment uploads only after the peer's
+  welcome message proves support (the `"gzip"` feature flag, or stock
+  CouchDB by vendor) — servers without it, older rustcouchdb included,
+  receive byte-identical requests to before. ~3.5× smaller transfers on
+  coordinate-heavy documents.
 
 ## Server performance
 

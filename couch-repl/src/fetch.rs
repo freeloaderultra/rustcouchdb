@@ -173,6 +173,7 @@ impl Fetcher {
             .map(|u| serde_json::json!({"id": u.id, "rev": u.rev}))
             .collect();
         let body = serde_json::to_vec(&serde_json::json!({ "docs": docs })).unwrap();
+        let (body, gzipped) = self.source.maybe_gzip(bytes::Bytes::from(body));
         let q = [
             ("revs", "true".to_string()),
             ("latest", "true".to_string()),
@@ -182,7 +183,7 @@ impl Fetcher {
             // keep RawValue slices, so issue the request manually with retry.
             let url = self.source.url(&["_bulk_get"]);
             crate::retry::with_retry(&self.source.retry, "POST source/_bulk_get", || async {
-                let rb = self
+                let mut rb = self
                     .source
                     .request(reqwest::Method::POST, url.clone())
                     .query(&q)
@@ -190,6 +191,9 @@ impl Fetcher {
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .body(body.clone())
                     .timeout(self.source.request_timeout().max(Duration::from_secs(120)));
+                if gzipped {
+                    rb = rb.header(reqwest::header::CONTENT_ENCODING, "gzip");
+                }
                 let resp = self.source.send(rb).await?;
                 resp.bytes().await.map_err(Error::Net)
             })

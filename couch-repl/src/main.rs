@@ -128,6 +128,7 @@ async fn replicate(args: cli::ReplicateArgs) -> i32 {
             checkpoint_interval: Duration::from_millis(args.checkpoint_interval.max(1000)),
             use_checkpoints: !args.no_checkpoints,
             use_bulk_get: !args.no_bulk_get,
+            request_gzip: !args.no_request_gzip,
             continue_on_error: args.continue_on_error,
             changes_limit: args.changes_limit.max(100),
             stats_interval: Duration::from_secs(args.stats_interval.max(1)),

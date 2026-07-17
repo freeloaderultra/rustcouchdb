@@ -389,5 +389,7 @@ fn continuous(
         header::CONTENT_TYPE,
         header::HeaderValue::from_static("application/json"),
     );
+    // A gzip encoder would buffer the heartbeat newlines this feed lives on.
+    resp.extensions_mut().insert(crate::compress::NoCompress);
     resp
 }

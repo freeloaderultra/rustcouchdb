@@ -94,6 +94,10 @@ pub struct ReplicateArgs {
     /// Never use _bulk_get; fetch docs individually
     #[arg(long)]
     pub no_bulk_get: bool,
+    /// Never gzip request bodies (compression is otherwise negotiated via
+    /// the server welcome message and off for servers that lack it)
+    #[arg(long)]
+    pub no_request_gzip: bool,
 
     /// Per-request timeout in seconds (streams are exempt)
     #[arg(long, default_value_t = 60)]

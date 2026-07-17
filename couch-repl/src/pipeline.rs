@@ -34,6 +34,9 @@ pub struct RepOptions {
     pub checkpoint_interval: Duration,
     pub use_checkpoints: bool,
     pub use_bulk_get: bool,
+    /// Gzip request bodies to servers that are known to inflate them
+    /// (welcome-probe negotiated; unknown/old servers keep identity bodies).
+    pub request_gzip: bool,
     pub continue_on_error: bool,
     pub changes_limit: usize,
     pub stats_interval: Duration,
@@ -53,6 +56,9 @@ pub async fn replicate(
     let started = Instant::now();
     let src_info = source.db_info().await?;
     let _tgt_info = target.ensure_db(opts.create_target).await?;
+    if opts.request_gzip {
+        tokio::join!(source.detect_gzip_support(), target.detect_gzip_support());
+    }
     info!(
         "replicating {} -> {} ({} docs at source, update_seq {})",
         source.db_name(),

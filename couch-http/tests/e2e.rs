@@ -1182,3 +1182,180 @@ async fn prometheus_metrics() {
     let r = with_auth(format!("{b}/_node/nonode@nohost/_prometheus")).send().await.unwrap();
     assert_eq!(r.status().as_u16(), 200);
 }
+
+/// Gzip transport negotiation: request bodies inflate, responses compress
+/// only for clients that ask, unknown encodings 415, continuous stays
+/// identity, tiny responses stay identity. The dev-dep reqwest has no gzip
+/// feature, so nothing here is transparently (de)compressed by the client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gzip_transport_negotiation() {
+    use flate2::read::GzDecoder;
+    use flate2::write::GzEncoder;
+    use std::io::{Read, Write};
+
+    let srv = start(None, false).await;
+    // Feature unification pulls reqwest's gzip feature into this test build
+    // (couch-repl enables it), and reqwest then transparently decompresses
+    // and strips Content-Encoding. This test inspects the raw wire, so turn
+    // that off explicitly.
+    let c = reqwest::Client::builder().no_gzip().build().unwrap();
+    let b = &srv.base;
+
+    // The welcome advertises the feature flag couch-repl probes for.
+    let (_, welcome) = jget(&c, b).await;
+    assert!(welcome["features"].as_array().unwrap().iter().any(|f| f == "gzip"));
+
+    jput(&c, &format!("{b}/gz"), &json!({})).await;
+
+    // Gzipped _bulk_docs request body (what a probed couch-repl sends).
+    let docs: Vec<Value> = (0..50)
+        .map(|i| json!({"_id": format!("d{i:03}"), "payload": "x".repeat(200), "n": i}))
+        .collect();
+    let plain = serde_json::to_vec(&json!({"docs": docs})).unwrap();
+    let mut enc = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(&plain).unwrap();
+    let compressed = enc.finish().unwrap();
+    assert!(compressed.len() < plain.len());
+    let r = c
+        .post(format!("{b}/gz/_bulk_docs"))
+        .header("content-type", "application/json")
+        .header("content-encoding", "gzip")
+        .body(compressed)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 201);
+    let (_, info) = jget(&c, &format!("{b}/gz")).await;
+    assert_eq!(info["doc_count"], json!(50));
+
+    // Response compression only when asked for.
+    let r = c.get(format!("{b}/gz/_all_docs?include_docs=true")).send().await.unwrap();
+    assert!(r.headers().get("content-encoding").is_none());
+    let plain_body = r.bytes().await.unwrap();
+    let r = c
+        .get(format!("{b}/gz/_all_docs?include_docs=true"))
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.headers().get("content-encoding").unwrap(), "gzip");
+    let gz_body = r.bytes().await.unwrap();
+    assert!(gz_body.len() < plain_body.len() / 2, "{} !< {}/2", gz_body.len(), plain_body.len());
+    let mut inflated = Vec::new();
+    GzDecoder::new(&gz_body[..]).read_to_end(&mut inflated).unwrap();
+    assert_eq!(&inflated[..], &plain_body[..]);
+    let v: Value = serde_json::from_slice(&inflated).unwrap();
+    assert_eq!(v["rows"].as_array().unwrap().len(), 50);
+
+    // Tiny responses skip compression even when the client accepts gzip.
+    let r = c
+        .get(format!("{b}/_up"))
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert!(r.headers().get("content-encoding").is_none());
+
+    // feed=continuous is never compressed: a gzip encoder would buffer the
+    // heartbeat newlines the replicator's liveness check depends on.
+    let r = c
+        .get(format!("{b}/gz/_changes?feed=continuous&timeout=200"))
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert!(r.headers().get("content-encoding").is_none());
+    let _ = r.bytes().await;
+    // feed=normal (paged) does compress.
+    let r = c
+        .get(format!("{b}/gz/_changes"))
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.headers().get("content-encoding").unwrap(), "gzip");
+
+    // Unsupported request encodings are rejected like stock chttpd.
+    let r = c
+        .post(format!("{b}/gz/_bulk_docs"))
+        .header("content-type", "application/json")
+        .header("content-encoding", "deflate")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 415);
+}
+
+/// Replication between two servers with the gzip probe active on both ends:
+/// bulk docs and a compressible attachment arrive intact through the
+/// compressed transport (the attachment lane's streamed multipart PUT rides
+/// Content-Encoding: gzip because text/csv is a compressible type).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replication_through_gzip_transport() {
+    let src = start(None, false).await;
+    let tgt = start(None, false).await;
+    let c = client();
+
+    jput(&c, &format!("{}/data", src.base), &json!({})).await;
+    let docs: Vec<Value> = (0..120)
+        .map(|i| json!({"_id": format!("doc{i:04}"), "track": vec![i; 32], "note": "gps run"}))
+        .collect();
+    jpost(&c, &format!("{}/data/_bulk_docs", src.base), &json!({"docs": docs})).await;
+
+    // A doc with a large compressible attachment (> inline threshold 64 KiB).
+    let csv = "lat,lon,speed\n52.1,9.7,3.4\n".repeat(4000);
+    let (s, v) = jput(
+        &c,
+        &format!("{}/data/with-att", src.base),
+        &json!({"kind": "csv-carrier"}),
+    )
+    .await;
+    assert_eq!(s, 201);
+    let rev = v["rev"].as_str().unwrap();
+    let r = c
+        .put(format!("{}/data/with-att/run.csv?rev={rev}", src.base))
+        .header("content-type", "text/csv")
+        .body(csv.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 201);
+
+    // Replicate src -> tgt over real HTTP (distinct servers, both new).
+    let (s, _) = jput(
+        &c,
+        &format!("{}/_replicator/gzjob", src.base),
+        &json!({
+            "source": format!("{}/data", src.base),
+            "target": format!("{}/data", tgt.base),
+            "create_target": true,
+        }),
+    )
+    .await;
+    assert_eq!(s, 201);
+    let mut state = String::new();
+    for _ in 0..150 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (s, v) = jget(&c, &format!("{}/_scheduler/docs/_replicator/gzjob", src.base)).await;
+        if s == 200 {
+            state = v["state"].as_str().unwrap_or("").to_string();
+            if state == "completed" || state == "failed" {
+                break;
+            }
+        }
+    }
+    assert_eq!(state, "completed");
+
+    let (_, info) = jget(&c, &format!("{}/data", tgt.base)).await;
+    assert_eq!(info["doc_count"], json!(121));
+    let (_, doc) = jget(&c, &format!("{}/data/doc0077", tgt.base)).await;
+    assert_eq!(doc["track"].as_array().unwrap().len(), 32);
+    let r = c
+        .get(format!("{}/data/with-att/run.csv", tgt.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.text().await.unwrap(), csv);
+}

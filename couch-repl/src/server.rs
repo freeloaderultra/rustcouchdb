@@ -122,6 +122,7 @@ impl JobSpec {
             checkpoint_interval: Duration::from_millis(self.checkpoint_interval_ms.max(1000)),
             use_checkpoints: !self.no_checkpoints,
             use_bulk_get: !self.no_bulk_get,
+            request_gzip: true,
             continue_on_error: self.continue_on_error,
             changes_limit: self.changes_limit.max(100),
             stats_interval: Duration::from_secs(5),

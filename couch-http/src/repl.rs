@@ -367,6 +367,7 @@ pub async fn build_spec(app: &App, doc: &Value) -> Result<Spec, String> {
             .and_then(|c| c.as_bool())
             .unwrap_or(true),
         use_bulk_get: true,
+        request_gzip: true,
         continue_on_error: false,
         changes_limit: 10000,
         stats_interval: Duration::from_secs(5),

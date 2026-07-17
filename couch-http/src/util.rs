@@ -69,21 +69,22 @@ pub fn parse_multipart_related(content_type: &str, body: &[u8]) -> ApiResult<Val
     }
     let mut bodies = Vec::new();
     for p in parts {
-        // Skip a leading -- (final delimiter) and CRLF
-        let p = p.strip_prefix(b"--".as_slice()).unwrap_or(p);
-        let p = strip_crlf(p);
-        if p.is_empty() {
+        // The final delimiter is "--boundary--": its part is just "--".
+        if p.starts_with(b"--") {
             continue;
         }
-        // Split headers from body at the first blank line.
+        // A part is "\r\n<headers>\r\n\r\n<body>\r\n" (headers may be empty,
+        // as in couch-repl's attachment parts, putting the blank line at
+        // position 0). Only that framing may be stripped: the body itself
+        // can begin or end with newlines that are attachment data.
         let body = match find(p, b"\r\n\r\n") {
             Some(i) => &p[i + 4..],
             None => match find(p, b"\n\n") {
                 Some(i) => &p[i + 2..],
-                None => p, // no headers at all
+                None => strip_one_leading_crlf(p), // no headers at all
             },
         };
-        bodies.push(trim_trailing_crlf(body).to_vec());
+        bodies.push(strip_one_trailing_crlf(body).to_vec());
     }
     if bodies.is_empty() {
         return Err(ApiError::bad_request("empty multipart body"));
@@ -126,18 +127,16 @@ fn find_all(hay: &[u8], needle: &[u8]) -> Vec<usize> {
     out
 }
 
-fn strip_crlf(mut p: &[u8]) -> &[u8] {
-    while p.first() == Some(&b'\r') || p.first() == Some(&b'\n') {
-        p = &p[1..];
-    }
-    p
+fn strip_one_leading_crlf(p: &[u8]) -> &[u8] {
+    p.strip_prefix(b"\r\n".as_slice())
+        .or_else(|| p.strip_prefix(b"\n".as_slice()))
+        .unwrap_or(p)
 }
 
-fn trim_trailing_crlf(mut p: &[u8]) -> &[u8] {
-    while p.last() == Some(&b'\r') || p.last() == Some(&b'\n') {
-        p = &p[..p.len() - 1];
-    }
-    p
+fn strip_one_trailing_crlf(p: &[u8]) -> &[u8] {
+    p.strip_suffix(b"\r\n".as_slice())
+        .or_else(|| p.strip_suffix(b"\n".as_slice()))
+        .unwrap_or(p)
 }
 
 #[cfg(test)]
@@ -171,5 +170,31 @@ mod tests {
             json!(base64::engine::general_purpose::STANDARD.encode("BBBB"))
         );
         assert_eq!(parsed["v"], json!(1));
+    }
+
+    /// Attachment bytes may begin or end with newlines and contain blank
+    /// lines; only the multipart framing CRLFs may be stripped. (A csv
+    /// ending in "\n" used to lose it — real replicated data corruption.)
+    #[test]
+    fn multipart_related_preserves_newlines_in_attachments() {
+        let doc = json!({
+            "_id": "d",
+            "_attachments": {
+                "runs.csv": {"follows": true, "content_type": "text/csv", "length": 14},
+            }
+        });
+        let data = "\n\na,b\r\n\r\n1,2\n\n";
+        assert_eq!(data.len(), 14);
+        let b = "xyz";
+        let body =
+            format!("--{b}\r\ncontent-type: application/json\r\n\r\n{doc}\r\n--{b}\r\n\r\n{data}\r\n--{b}--");
+        let parsed =
+            parse_multipart_related(&format!("multipart/related; boundary=\"{b}\""), body.as_bytes())
+                .unwrap();
+        use base64::Engine;
+        assert_eq!(
+            parsed["_attachments"]["runs.csv"]["data"],
+            json!(base64::engine::general_purpose::STANDARD.encode(data))
+        );
     }
 }

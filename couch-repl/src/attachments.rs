@@ -138,6 +138,7 @@ impl AttLane {
 
         // 2. Rewrite attachment stubs into multipart "follows" references.
         let mut atts: Vec<(String, u64)> = Vec::new();
+        let (mut total_len, mut compressible_len) = (0u64, 0u64);
         if let Some(map) = doc
             .get_mut("_attachments")
             .and_then(|a| a.as_object_mut())
@@ -149,6 +150,11 @@ impl AttLane {
                 let length = obj.get("length").and_then(|l| l.as_u64()).ok_or_else(|| {
                     Error::Protocol(format!("attachment {name} in {} has no length", ad.id))
                 })?;
+                total_len += length;
+                let ct = obj.get("content_type").and_then(|c| c.as_str()).unwrap_or("");
+                if compressible_content_type(ct) {
+                    compressible_len += length;
+                }
                 obj.remove("stub");
                 obj.insert("follows".into(), serde_json::Value::Bool(true));
                 // We always send identity bytes; drop metadata describing the
@@ -161,6 +167,10 @@ impl AttLane {
                 atts.push((name.clone(), length));
             }
         }
+        // Transport-level gzip for the whole multipart PUT when the target
+        // inflates it and the payload is worth compressing (mostly text-like
+        // attachment bytes; a JPEG-dominated doc stays identity).
+        let gzip_body = self.target.gzip_requests() && compressible_len * 2 >= total_len;
         if atts.is_empty() {
             // A false-positive routing (e.g. "_attachments" inside a string
             // value): write it as a plain doc.
@@ -237,15 +247,24 @@ impl AttLane {
 
         // 4. PUT it. No overall timeout: attachment size is unbounded.
         let url = self.target.url(&[&ad.id]);
-        let rb = self
+        let mut rb = self
             .target
             .request(reqwest::Method::PUT, url)
             .query(&[("new_edits", "false")])
             .header(
                 reqwest::header::CONTENT_TYPE,
                 format!("multipart/related; boundary=\"{boundary}\""),
-            )
-            .body(reqwest::Body::wrap_stream(ReceiverStream::new(body_rx)));
+            );
+        rb = if gzip_body {
+            let encoded = async_compression::tokio::bufread::GzipEncoder::with_quality(
+                tokio_util::io::StreamReader::new(ReceiverStream::new(body_rx)),
+                async_compression::Level::Fastest,
+            );
+            rb.header(reqwest::header::CONTENT_ENCODING, "gzip")
+                .body(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(encoded)))
+        } else {
+            rb.body(reqwest::Body::wrap_stream(ReceiverStream::new(body_rx)))
+        };
         let result = self.target.send(rb).await;
         pump.abort();
         let resp = result?;
@@ -256,15 +275,32 @@ impl AttLane {
 
     async fn put_plain(&self, ad: &AttachmentDoc, raw: Box<RawValue>) -> Result<()> {
         let url = self.target.url(&[&ad.id]);
-        let rb = self
+        let (body, gzipped) = self
+            .target
+            .maybe_gzip(Bytes::copy_from_slice(raw.get().as_bytes()));
+        let mut rb = self
             .target
             .request(reqwest::Method::PUT, url)
             .query(&[("new_edits", "false")])
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(raw.get().to_string())
+            .body(body)
             .timeout(self.target.request_timeout());
+        if gzipped {
+            rb = rb.header(reqwest::header::CONTENT_ENCODING, "gzip");
+        }
         let resp = self.target.send(rb).await?;
         let _ = resp.bytes().await;
         Ok(())
     }
+}
+
+/// Attachment content types worth gzipping in transit — the shape of stock
+/// CouchDB's `compressible_types` default (text/*, json, xml, javascript).
+/// Already-compressed media buys nothing from another compression pass.
+fn compressible_content_type(ct: &str) -> bool {
+    let mime = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    mime.starts_with("text/")
+        || mime.contains("json")
+        || mime.contains("xml")
+        || mime.contains("javascript")
 }
