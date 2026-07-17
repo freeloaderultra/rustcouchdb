@@ -50,7 +50,14 @@ pub async fn index_create(
     let idx = v
         .get("index")
         .ok_or_else(|| ApiError::bad_request("Missing required key: index"))?;
-    let kind = match v.get("type").and_then(|t| t.as_str()) {
+    // "type" is accepted both as a sibling of "index" (CouchDB's shape)
+    // and inside it — client libraries like kivik only let callers set
+    // the index object, not the request envelope.
+    let kind = match v
+        .get("type")
+        .or_else(|| idx.get("type"))
+        .and_then(|t| t.as_str())
+    {
         None | Some("json") => IndexKind::Json,
         Some("spatial") => IndexKind::Spatial,
         Some(t) => {

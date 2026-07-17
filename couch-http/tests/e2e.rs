@@ -880,11 +880,11 @@ async fn spatial_index_serves_bbox_intersection() {
     .await;
     assert_eq!(st, 200, "{v}");
     assert_eq!(v["result"], "created");
-    // same definition again → exists
+    // same definition again, kivik-style (type inside index) → exists
     let (_, v2) = jpost(
         &c,
         &format!("{b}/geo/_index"),
-        &json!({"type": "spatial", "index": {"fields": [
+        &json!({"index": {"type": "spatial", "fields": [
             "boundingBox.topLeft.longitude",
             "boundingBox.bottomRight.latitude",
             "boundingBox.bottomRight.longitude",
