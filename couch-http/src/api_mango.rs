@@ -231,6 +231,10 @@ pub async fn find(
     let selector = couch_mango::Selector::compile(&fq.selector)
         .map_err(|e| ApiError::bad_request(format!("invalid selector: {e}")))?;
 
+    // Proto-blob awareness: with schemas registered, selectors, index keys
+    // and projections can reach fields inside protobuf blob attachments.
+    let aug_fn = blocking(|| state.proto_registry()).map(crate::proto::augmenter);
+
     // Serialize index-file writes: choosing, materializing and updating the
     // index happen under the per-db lock. The scan itself runs after the
     // lock is dropped — index reads are preads against an append-only file,
@@ -238,6 +242,7 @@ pub async fn find(
     // one slow full scan no longer blocks every other Mango request.
     let guard = dbh.index_lock.lock().await;
     let dbh1 = dbh.clone();
+    let aug1 = aug_fn.as_ref();
     let (snap, chosen) = blocking(|| -> ApiResult<_> {
         let snap = dbh1.snapshot();
         let dir = index::index_dir(&dbh1.path);
@@ -250,7 +255,7 @@ pub async fn find(
                     // defined by a design doc but never built: build it now
                     None => index::materialize(&dir, &d.def, &snap.header.uuid_str())?,
                 };
-                idx.update(&snap)?;
+                idx.update(&snap, aug1.map(|f| f as _))?;
                 let plan = chosen.plan.take().ok_or_else(|| {
                     ApiError::bad_request("chosen index without a plan")
                 })?;
@@ -269,6 +274,7 @@ pub async fn find(
             chosen.as_ref().map(|(i, p)| (i, p)),
             &fq,
             &selector,
+            aug_fn.as_ref().map(|f| f as _),
             &mut |doc| {
                 docs.push(doc);
                 Ok(())

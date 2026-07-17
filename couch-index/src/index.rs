@@ -172,7 +172,18 @@ impl Index {
     /// Bring the index up to date with the source database. Mirrors
     /// couch_index_updater: fold changes since our seq, compute each doc's
     /// key, replace its old entries. Returns docs processed.
-    pub fn update(&mut self, db: &Db) -> Result<u64> {
+    ///
+    /// `augment` (see [`crate::find::Augmenter`]) lets indexes reach fields
+    /// inside decodable proto-blob attachments. To keep incremental updates
+    /// cheap it only runs for docs the head JSON can't serve: an indexed
+    /// field is missing, or a partial_filter_selector needs evaluating.
+    /// Indexes created before a schema was registered don't re-key existing
+    /// docs — create (or rebuild) blob-field indexes after registering.
+    pub fn update(
+        &mut self,
+        db: &Db,
+        augment: Option<crate::find::Augmenter<'_>>,
+    ) -> Result<u64> {
         if db.header.uuid_str() != self.source_uuid {
             return Err(Error::BadRequest(format!(
                 "index {} was built from a different database (uuid mismatch)",
@@ -208,11 +219,25 @@ impl Index {
                         Some(w) => db.doc_json(&fdi, &w, &Default::default())?,
                         None => return Ok(ControlFlow::Continue(())),
                     };
-                    let matches_pfs = pfs.as_ref().map(|s| s.matches(&doc)).unwrap_or(true);
+                    let view = match augment {
+                        Some(f)
+                            if pfs.is_some()
+                                || self
+                                    .def
+                                    .fields
+                                    .iter()
+                                    .any(|p| couch_mango::get_field(&doc, p).is_none()) =>
+                        {
+                            f(db, &doc)
+                        }
+                        _ => None,
+                    };
+                    let target = view.as_ref().unwrap_or(&doc);
+                    let matches_pfs = pfs.as_ref().map(|s| s.matches(target)).unwrap_or(true);
                     if !matches_pfs {
                         None
                     } else {
-                        doc_key(&self.def, &doc, &fdi.id)
+                        doc_key(&self.def, target, &fdi.id)
                     }
                 };
                 pending.push((fdi.id.clone(), fdi.update_seq, new_key));

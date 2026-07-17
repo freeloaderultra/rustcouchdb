@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["couch-mango", "couch-repl", "couch-store", "couch-index", "couch-http"]
+members = ["couch-mango", "couch-repl", "couch-store", "couch-index", "couch-http", "couch-proto"]
 
 [profile.release]
 lto = true

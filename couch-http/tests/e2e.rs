@@ -1499,3 +1499,264 @@ fn futures_stream_iter(
 ) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
     futures::stream::iter(chunks)
 }
+
+// ---- proto-aware Mango ----------------------------------------------------
+
+/// Minimal protobuf wire encoding for the test payloads (field numbers and
+/// types must line up with `proto_descriptor_set` below).
+fn pb_f64(field: u32, v: f64) -> Vec<u8> {
+    let mut b = vec![((field << 3) | 1) as u8];
+    b.extend_from_slice(&v.to_le_bytes());
+    b
+}
+fn pb_bytes(field: u32, data: &[u8]) -> Vec<u8> {
+    assert!(data.len() < 128);
+    let mut b = vec![((field << 3) | 2) as u8, data.len() as u8];
+    b.extend_from_slice(data);
+    b
+}
+fn pb_varint(field: u32, mut v: u64) -> Vec<u8> {
+    let mut b = vec![(field << 3) as u8];
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            b.push(byte);
+            break;
+        }
+        b.push(byte | 0x80);
+    }
+    b
+}
+
+/// message test.v1.Point { double latitude = 1; double longitude = 2; }
+/// message test.v1.FieldBoundary { string name = 1; double area = 2;
+///   repeated Point geo_points = 3; int64 big_count = 4; Point top_left = 5; }
+fn proto_descriptor_set() -> Vec<u8> {
+    use prost::Message as _;
+    use prost_types::{
+        field_descriptor_proto::{Label, Type},
+        DescriptorProto, FieldDescriptorProto, FileDescriptorProto, FileDescriptorSet,
+    };
+    let field = |name: &str, number: i32, typ: Type, type_name: Option<&str>, repeated: bool| {
+        FieldDescriptorProto {
+            name: Some(name.into()),
+            number: Some(number),
+            r#type: Some(typ as i32),
+            type_name: type_name.map(String::from),
+            label: Some(if repeated { Label::Repeated } else { Label::Optional } as i32),
+            ..Default::default()
+        }
+    };
+    FileDescriptorSet {
+        file: vec![FileDescriptorProto {
+            name: Some("test/v1/test.proto".into()),
+            package: Some("test.v1".into()),
+            syntax: Some("proto3".into()),
+            message_type: vec![
+                DescriptorProto {
+                    name: Some("Point".into()),
+                    field: vec![
+                        field("latitude", 1, Type::Double, None, false),
+                        field("longitude", 2, Type::Double, None, false),
+                    ],
+                    ..Default::default()
+                },
+                DescriptorProto {
+                    name: Some("FieldBoundary".into()),
+                    field: vec![
+                        field("name", 1, Type::String, None, false),
+                        field("area", 2, Type::Double, None, false),
+                        field("geo_points", 3, Type::Message, Some(".test.v1.Point"), true),
+                        field("big_count", 4, Type::Int64, None, false),
+                        field("top_left", 5, Type::Message, Some(".test.v1.Point"), false),
+                    ],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }],
+    }
+    .encode_to_vec()
+}
+
+fn boundary_blob(name: &str, area: f64, lat: f64, lon: f64, big: u64) -> Vec<u8> {
+    let point = [pb_f64(1, lat), pb_f64(2, lon)].concat();
+    let mut m = pb_bytes(1, name.as_bytes());
+    m.extend(pb_f64(2, area));
+    m.extend(pb_bytes(3, &point));
+    m.extend(pb_varint(4, big));
+    m.extend(pb_bytes(5, &point));
+    m
+}
+
+async fn put_blob_doc(c: &reqwest::Client, base: &str, db: &str, id: &str, doctype: &str, blob: &[u8]) {
+    let head = json!({"db": {"DocType": doctype, "IsBinaryBlob": true, "OwnerId": "u1"}});
+    let (s, v) = jput(c, &format!("{base}/{db}/{id}"), &head).await;
+    assert_eq!(s, 201, "{v}");
+    let rev = v["rev"].as_str().unwrap();
+    let r = c
+        .put(format!("{base}/{db}/{id}/blob.data?rev={rev}"))
+        .header("content-type", "application/protobuf")
+        .body(blob.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 201);
+}
+
+/// The nxguide blob-document pattern: JSON head + `blob.data` protobuf
+/// attachment. With a FileDescriptorSet registered in `_schemas`, Mango
+/// selectors, projections and indexes reach fields inside the blob; without
+/// one (or for unregistered doctypes) blobs stay opaque and nothing changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proto_schema_mango() {
+    let srv = start(None, false).await;
+    let c = client();
+    let b = &srv.base;
+
+    let (_, welcome) = jget(&c, b).await;
+    assert!(welcome["features"].as_array().unwrap().iter().any(|f| f == "proto-schemas"));
+
+    jput(&c, &format!("{b}/pdb"), &json!({})).await;
+    put_blob_doc(&c, b, "pdb", "f1", "field_boundary", &boundary_blob("small", 50.0, 48.10, 11.5, 7)).await;
+    put_blob_doc(&c, b, "pdb", "f2", "field_boundary", &boundary_blob("mid", 150.0, 48.20, 11.6, 77)).await;
+    put_blob_doc(&c, b, "pdb", "f3", "field_boundary", &boundary_blob("big", 250.0, 48.30, 11.7, 777)).await;
+    put_blob_doc(&c, b, "pdb", "f4", "field_boundary", &boundary_blob("huge", 999.0, 48.40, 11.8, 7777)).await;
+    put_blob_doc(&c, b, "pdb", "m1", "mystery", &boundary_blob("who", 500.0, 0.0, 0.0, 1)).await;
+    let (s, _) = jput(&c, &format!("{b}/pdb/plain1"), &json!({"area": 700.0, "kind": "json"})).await;
+    assert_eq!(s, 201);
+
+    let area_query = json!({"selector": {"area": {"$gte": 100}}, "limit": 50});
+    let ids = |v: &Value| -> Vec<String> {
+        let mut ids: Vec<String> = v["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["_id"].as_str().unwrap().to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    // Without schemas the blobs are opaque: only the plain JSON doc matches.
+    let (s, v) = jpost(&c, &format!("{b}/pdb/_find"), &area_query).await;
+    assert_eq!(s, 200);
+    assert_eq!(ids(&v), vec!["plain1"]);
+
+    // Register the descriptor set (an ordinary db + doc + attachment).
+    assert_eq!(jput(&c, &format!("{b}/_schemas"), &json!({})).await.0, 201);
+    let (s, v) = jput(
+        &c,
+        &format!("{b}/_schemas/nxguide"),
+        &json!({"doctypes": {"legacy_thing": "test.v1.FieldBoundary"}}),
+    )
+    .await;
+    assert_eq!(s, 201);
+    let rev = v["rev"].as_str().unwrap();
+    let r = c
+        .put(format!("{b}/_schemas/nxguide/descriptor.pb?rev={rev}"))
+        .header("content-type", "application/octet-stream")
+        .body(proto_descriptor_set())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 201);
+
+    // Same query now reaches inside the blobs (registry cache invalidated by
+    // the _schemas write). Returned docs stay the stored heads.
+    let (s, v) = jpost(&c, &format!("{b}/pdb/_find"), &area_query).await;
+    assert_eq!(s, 200);
+    assert_eq!(ids(&v), vec!["f2", "f3", "f4", "plain1"]);
+    let f2 = v["docs"].as_array().unwrap().iter().find(|d| d["_id"] == "f2").unwrap();
+    assert!(f2.get("area").is_none(), "bare docs must stay stored heads: {f2}");
+    assert_eq!(f2["db"]["DocType"], json!("field_boundary"));
+
+    // Projections may name blob-interior fields.
+    let (s, v) = jpost(
+        &c,
+        &format!("{b}/pdb/_find"),
+        &json!({
+            "selector": {"area": {"$gte": 100}},
+            "fields": ["_id", "area", "topLeft.latitude"],
+            "limit": 50,
+        }),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let f3 = v["docs"].as_array().unwrap().iter().find(|d| d["_id"] == "f3").unwrap();
+    assert_eq!(f3["area"], json!(250.0));
+    assert_eq!(f3["topLeft"]["latitude"], json!(48.30));
+
+    // int64 fields stringify exactly like protojson.
+    let (s, v) = jpost(
+        &c,
+        &format!("{b}/pdb/_find"),
+        &json!({"selector": {"bigCount": "77"}, "limit": 50}),
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert_eq!(ids(&v), vec!["f2"]);
+
+    // Unregistered doctypes stay opaque but remain findable by their head.
+    let (s, v) = jpost(
+        &c,
+        &format!("{b}/pdb/_find"),
+        &json!({"selector": {"db.DocType": "mystery", "area": {"$exists": true}}, "limit": 50}),
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert!(ids(&v).is_empty());
+    let (_, v) = jpost(
+        &c,
+        &format!("{b}/pdb/_find"),
+        &json!({"selector": {"db.DocType": "mystery"}, "limit": 50}),
+    )
+    .await;
+    assert_eq!(ids(&v), vec!["m1"]);
+
+    // A Mango index on a blob-interior field: built through the decoder,
+    // serves sorted range queries.
+    let (s, v) = jpost(
+        &c,
+        &format!("{b}/pdb/_index"),
+        &json!({"index": {"fields": ["area"]}, "name": "idx_area"}),
+    )
+    .await;
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = jpost(
+        &c,
+        &format!("{b}/pdb/_explain"),
+        &json!({"selector": {"area": {"$gte": 100}}, "sort": [{"area": "asc"}]}),
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert_eq!(v["index"]["name"], json!("idx_area"), "{v}");
+    let (s, v) = jpost(
+        &c,
+        &format!("{b}/pdb/_find"),
+        &json!({"selector": {"area": {"$gte": 100}}, "sort": [{"area": "asc"}], "limit": 50}),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let order: Vec<String> = v["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_str().unwrap().to_string())
+        .collect();
+    // blob areas 150, 250, 999 collate with the plain doc's 700
+    assert_eq!(order, vec!["f2", "f3", "plain1", "f4"]);
+
+    // Incremental index update keys a NEW blob doc through the decoder, and
+    // the explicit doctypes mapping resolves non-convention names.
+    put_blob_doc(&c, b, "pdb", "lg1", "legacy_thing", &boundary_blob("legacy", 100000.0, 1.0, 2.0, 5)).await;
+    let (s, v) = jpost(
+        &c,
+        &format!("{b}/pdb/_find"),
+        &json!({"selector": {"area": {"$gte": 100000}}, "limit": 50}),
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert_eq!(ids(&v), vec!["lg1"]);
+}

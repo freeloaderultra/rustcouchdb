@@ -338,6 +338,33 @@ impl Db {
     ) -> Option<&'a AttInfo> {
         summary.atts.iter().find(|a| a.name == name)
     }
+
+    /// Identity-form bytes of the winning rev's attachment `name`.
+    /// Returns None when the doc, winner, or attachment doesn't exist, or
+    /// when the attachment is larger than `max` (callers decode these bytes
+    /// in memory, so they bound the size). Stored-gzip data is inflated.
+    pub fn att_bytes(&self, id: &[u8], name: &str, max: u64) -> Result<Option<Vec<u8>>> {
+        let Some(fdi) = self.open_doc_info(id)? else {
+            return Ok(None);
+        };
+        let Some(leaf) = fdi.rev_tree.winner() else {
+            return Ok(None);
+        };
+        let RevVal::Leaf(lv) = leaf.leaf else {
+            return Ok(None);
+        };
+        let Some(ptr) = lv.ptr else {
+            return Ok(None);
+        };
+        let summary = doc::read_summary(&self.file, ptr)?;
+        let Some(att) = self.find_att(&summary, name) else {
+            return Ok(None);
+        };
+        if att.att_len > max || att.disk_len > max {
+            return Ok(None);
+        }
+        Ok(Some(doc::read_att_data_decoded(&self.file, att)?))
+    }
 }
 
 #[derive(Default, Clone)]

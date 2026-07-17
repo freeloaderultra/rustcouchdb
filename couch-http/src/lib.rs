@@ -15,6 +15,7 @@ pub mod compress;
 pub mod error;
 pub mod jsfilter;
 pub mod metrics;
+pub mod proto;
 pub mod repl;
 pub mod spool;
 pub mod state;

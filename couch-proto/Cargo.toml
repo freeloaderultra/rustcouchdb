@@ -1,0 +1,11 @@
+[package]
+name = "couch-proto"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+prost = "0.13"
+prost-types = "0.13"
+prost-reflect = { version = "0.14", features = ["serde"] }
+serde_json = "1"

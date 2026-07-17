@@ -20,7 +20,7 @@ pub async fn welcome(State(state): State<App>) -> Json<Value> {
         // "gzip" is the rustcouchdb extension flag couch-repl probes for
         // before sending Content-Encoding: gzip request bodies; servers
         // without it (older rustcouchdb) get identity bodies.
-        "features": ["access-ready", "gzip", "partitioned", "pluggable-storage-engines", "reshard", "scheduler"],
+        "features": ["access-ready", "gzip", "partitioned", "pluggable-storage-engines", "proto-schemas", "reshard", "scheduler"],
         "vendor": {"name": "rustcouchdb", "variant": "rust"},
     }))
 }

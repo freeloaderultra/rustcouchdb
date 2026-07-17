@@ -169,6 +169,9 @@ pub struct ServerState {
     pub repl: crate::repl::ReplManager,
     layout: Layout,
     uuid_counter: AtomicU64,
+    /// Proto registry cache: (update_seq of the `_schemas` snapshot it was
+    /// built from, the registry — None when `_schemas` holds nothing usable).
+    proto_cache: RwLock<Option<(u64, Option<Arc<couch_proto::Registry>>)>>,
 }
 
 pub type App = Arc<ServerState>;
@@ -195,7 +198,25 @@ impl ServerState {
             repl: crate::repl::ReplManager::default(),
             layout,
             uuid_counter: AtomicU64::new(0),
+            proto_cache: RwLock::new(None),
         }
+    }
+
+    /// The proto schema registry built from the `_schemas` database, rebuilt
+    /// whenever that database's update_seq moves. None without a usable
+    /// `_schemas`. Does file IO on rebuild — call from a blocking context.
+    pub fn proto_registry(&self) -> Option<Arc<couch_proto::Registry>> {
+        let sdb = self.dbs.read().unwrap().get(crate::proto::SCHEMAS_DB).cloned()?;
+        let snap = sdb.snapshot();
+        let seq = snap.header.update_seq;
+        if let Some((cached_seq, reg)) = &*self.proto_cache.read().unwrap() {
+            if *cached_seq == seq {
+                return reg.clone();
+            }
+        }
+        let reg = crate::proto::build_registry(&snap);
+        *self.proto_cache.write().unwrap() = Some((seq, reg.clone()));
+        reg
     }
 
     /// Where a NEW database with this name would be created. Databases that
@@ -416,9 +437,13 @@ impl ServerState {
 
 /// CouchDB db-name rule, minus `/` (no sharding here) but allowing the
 /// leading-underscore system names CouchDB accepts (_replicator, _users,
-/// _global_changes).
+/// _global_changes) plus rustcouchdb's _schemas (proto descriptor sets).
 pub fn valid_db_name(name: &str) -> bool {
-    if name == "_replicator" || name == "_users" || name == "_global_changes" {
+    if name == "_replicator"
+        || name == "_users"
+        || name == "_global_changes"
+        || name == crate::proto::SCHEMAS_DB
+    {
         return true;
     }
     let mut chars = name.chars();

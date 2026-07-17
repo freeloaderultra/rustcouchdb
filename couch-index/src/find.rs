@@ -205,6 +205,13 @@ pub struct FindStats {
     pub results: u64,
 }
 
+/// Optional proto-blob augmentation hook: given the database and a stored
+/// doc, returns the augmented view (decoded blob fields + head overlay) when
+/// the doc is a decodable blob document, None otherwise. Selector matching
+/// and field projection run against the augmented view; docs emitted without
+/// a `fields` projection stay the stored JSON.
+pub type Augmenter<'a> = &'a dyn Fn(&Db, &Value) -> Option<Value>;
+
 /// Execute the query, streaming result docs to `emit`. Takes the (already
 /// updated) index by reference rather than the Chosen borrow so callers can
 /// release any index-file lock before the scan — reads are pure preads on
@@ -214,6 +221,7 @@ pub fn execute<F>(
     index: Option<(&Index, &Plan)>,
     query: &FindQuery,
     selector: &Selector,
+    augment: Option<Augmenter<'_>>,
     emit: &mut F,
 ) -> Result<FindStats>
 where
@@ -227,7 +235,10 @@ where
     let mut skipped = 0usize;
     let mut process = |doc: Value, stats: &mut FindStats| -> Result<ControlFlow<()>> {
         stats.docs_examined += 1;
-        if !selector.matches(&doc) {
+        // Match against the augmented view when one exists — never against
+        // the head alone, since added fields can flip $not-style clauses.
+        let view = augment.and_then(|f| f(db, &doc));
+        if !selector.matches(view.as_ref().unwrap_or(&doc)) {
             return Ok(ControlFlow::Continue(()));
         }
         if skipped < query.skip {
@@ -238,7 +249,13 @@ where
             return Ok(ControlFlow::Break(()));
         }
         stats.results += 1;
-        emit(project(doc, &query.fields))?;
+        // A projection may name blob-interior fields (the caller opted in);
+        // a bare doc result stays the stored JSON.
+        let out = match (&query.fields, view) {
+            (Some(_), Some(v)) => v,
+            _ => doc,
+        };
+        emit(project(out, &query.fields))?;
         if stats.results as usize >= query.limit {
             return Ok(ControlFlow::Break(()));
         }

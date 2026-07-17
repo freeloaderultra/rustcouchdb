@@ -12,6 +12,7 @@ module with Rust that speaks the same protocols and the same on-disk format.
 | [`couch-store`](couch-store/) | Storage engine for `.couch` shard files — couch_file / couch_btree / couch_key_tree ported to Rust, read **and** write, plus a compactor. | verified bidirectionally against CouchDB 3.5.1 (server opens, updates, compacts and replicates out of Rust-written files — and reads files couch-store compacted); bulk ingest ~2.5× the server's HTTP rate |
 | [`couch-index`](couch-index/) | Mango JSON indexes on couch-store btrees: planner, incremental updater and `_find` execution ported from the mango application. Plus **spatial (bounding-box) indexes** — a rustcouchdb extension CouchDB never had natively: linear-quadtree keys on the same btrees, chosen automatically for plain Mango bbox-range selectors. | oracle-tested vs CouchDB `_find` (identical results on an nxguide-shaped 100k-doc suite); index builds ~4× faster, queries 1.3–4× faster; bbox queries 228× faster than the doctype-index scan they replace (50k docs: 7 ms vs 1.7 s, identical results) |
 | [`couch-mango`](couch-mango/) | Shared library: the Mango selector engine and EJSON collation (used by couch-repl filtering and couch-index keys/post-filtering). | 19-selector parity suite vs CouchDB |
+| [`couch-proto`](couch-proto/) | Protobuf schema registry + dynamic decode: register `FileDescriptorSet`s in a replicated `_schemas` database and Mango selectors, projections and indexes reach fields **inside** `application/protobuf` blob attachments — stored bytes untouched. | e2e-tested end to end (opaque→transparent on registration, blob-field indexes, protojson naming parity) |
 | [`couch-http`](couch-http/) | **The rustcouchdb server**: CouchDB's HTTP API in one Rust binary — docs, attachments, `_changes`, `_find`/`_index`, `_replicator`/`_scheduler` (embedded couch-repl), cookie auth, native validate_doc_update, auto-compaction. Ships as a ~160 MB no-dependency container. | 59/59 HTTP parity checks vs CouchDB 3.5.1; 11/11 replication interop incl. the stock Erlang replicator pushing to **and** pulling from it |
 
 All crates build from the workspace with `cargo build --release` (rustls only, no
@@ -39,6 +40,20 @@ OpenSSL; runs on ARM Linux).
   land in the .couch file in 1 MiB chunks; downloads stream the stored
   chunk list. A 300 MB attachment transfer holds the server around
   25–50 MB RSS. Size is unbounded (stock's max_attachment_size default).
+- Proto-aware Mango — a rustcouchdb extension for the "blob document"
+  pattern (JSON head + one `application/protobuf` attachment): upload
+  protobuf `FileDescriptorSet`s as attachments in a `_schemas` database
+  (it's an ordinary database, so descriptors replicate to the fleet like
+  any data) and selectors, `fields` projections and Mango indexes resolve
+  paths inside the blob, decoded on the fly with protojson naming — the
+  same paths the app uses for its JSON docs. Message types resolve from
+  `db.DocType` by convention (snake_case of the message name) or an
+  explicit `doctypes` mapping in the schema doc. Docs returned without a
+  projection stay byte-identical stored JSON; unregistered types and
+  oversized blobs stay opaque; the attachment bytes are never rewritten,
+  so replication (to stock CouchDB included) is unaffected. Create
+  blob-field indexes after registering schemas — already-indexed docs
+  aren't re-keyed retroactively.
 - HTTP gzip, negotiated per request (stock CouchDB compresses neither
   direction of replication traffic). Responses compress only for clients
   sending `Accept-Encoding: gzip` (`feed=continuous` always stays identity

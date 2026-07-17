@@ -132,7 +132,7 @@ fn run(cmd: Cmd) -> Result<()> {
             def.name = name.unwrap_or_else(|| def.auto_name());
             let mut idx =
                 index::Index::create(&dir_for(&db, &dir), def, &database.header.uuid_str())?;
-            let n = idx.update(&database)?;
+            let n = idx.update(&database, None)?;
             println_json(
                 &json!({"ok": true, "name": idx.def.name, "docs_indexed": n, "rows": idx.row_count()}),
             );
@@ -145,7 +145,7 @@ fn run(cmd: Cmd) -> Result<()> {
         Cmd::Update { db, dir } => {
             let database = Db::open(&db)?;
             for mut idx in index::list(&dir_for(&db, &dir))? {
-                let n = idx.update(&database)?;
+                let n = idx.update(&database, None)?;
                 println_json(
                     &json!({"name": idx.def.name, "docs_processed": n, "rows": idx.row_count(), "update_seq": idx.update_seq}),
                 );
@@ -196,7 +196,7 @@ fn run(cmd: Cmd) -> Result<()> {
                     };
                     // --stale can't serve a never-built index: build it once
                     if !stale || fresh {
-                        idx.update(&database)?;
+                        idx.update(&database, None)?;
                     }
                     Some((idx, chosen.plan.take().expect("chosen index has a plan")))
                 }
@@ -207,6 +207,7 @@ fn run(cmd: Cmd) -> Result<()> {
                 picked.as_ref().map(|(i, p)| (i, p)),
                 &fq,
                 &selector,
+                None,
                 &mut |doc| {
                     println_json(&doc);
                     Ok(())
