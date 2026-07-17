@@ -2,17 +2,22 @@
 //! POST /db, attachments, _local docs.
 
 use crate::error::{ApiError, ApiResult};
+use crate::spool::{parse_multipart_stream, spool_body};
 use crate::state::{blocking, App};
-use crate::util::{parse_json, parse_multipart_related, qbool, Q};
-use axum::extract::{Path, Query, State};
+use crate::util::{parse_json, qbool, Q};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use base64::Engine;
 use couch_store::db::DocOpts;
-use couch_store::writer::{DocUpdate, SaveOutcome};
+use couch_store::writer::{DocUpdate, SaveOutcome, SpooledAtt};
 use couch_store::{doc as docmod};
 use serde_json::{json, Map, Value};
+
+/// JSON request bodies keep the pre-streaming cap; attachment bodies and
+/// multipart attachment parts are spooled to disk and unbounded (stock's
+/// max_attachment_size defaults to infinity).
+const JSON_BODY_LIMIT: usize = 1024 * 1024 * 1024;
 
 fn etag(rev: &str) -> header::HeaderValue {
     header::HeaderValue::from_str(&format!("\"{rev}\"")).expect("valid etag")
@@ -249,7 +254,18 @@ fn open_revs_multipart<'a>(
 // ---------------------------------------------------------------- PUT/POST
 
 /// Shared write path for PUT doc / POST db.
-fn write_doc(state: &App, db: &str, mut doc: Value, q: &Q, headers: &HeaderMap) -> ApiResult<Response> {
+fn write_doc(state: &App, db: &str, doc: Value, q: &Q, headers: &HeaderMap) -> ApiResult<Response> {
+    write_doc_with_spools(state, db, doc, Vec::new(), q, headers)
+}
+
+fn write_doc_with_spools(
+    state: &App,
+    db: &str,
+    mut doc: Value,
+    spools: Vec<SpooledAtt>,
+    q: &Q,
+    headers: &HeaderMap,
+) -> ApiResult<Response> {
     let dbh = state.db(db)?;
     let obj = doc
         .as_object_mut()
@@ -287,7 +303,8 @@ fn write_doc(state: &App, db: &str, mut doc: Value, q: &Q, headers: &HeaderMap) 
     if new_edits {
         let validator = state.validator_for(db);
         let deleted = doc.get("_deleted") == Some(&Value::Bool(true));
-        let outcome = blocking(|| dbh.with_writer(|w| w.save_doc(&doc, validator)))?;
+        let outcome =
+            blocking(|| dbh.with_writer(|w| w.save_doc_with_spools(&doc, validator, spools)))?;
         match outcome {
             SaveOutcome::Ok { rev } => {
                 if db == "_replicator" {
@@ -300,7 +317,7 @@ fn write_doc(state: &App, db: &str, mut doc: Value, q: &Q, headers: &HeaderMap) 
             SaveOutcome::Error { error, reason } => Err(ApiError::from_save(&error, &reason)),
         }
     } else {
-        let upd = DocUpdate::from_json(doc)?;
+        let upd = DocUpdate::from_json_with_spools(doc, spools)?;
         let rev = docmod::rev_str(upd.rev_path.0, &upd.rev_path.1[0]);
         blocking(|| dbh.with_writer(|w| w.update_docs(vec![upd])))?;
         if db == "_replicator" {
@@ -325,21 +342,68 @@ pub async fn doc_put(
     Path((db, docid)): Path<(String, String)>,
     Query(q): Query<Q>,
     headers: HeaderMap,
-    body: bytes::Bytes,
+    request: Request,
 ) -> ApiResult<Response> {
     let ct = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let mut doc = if ct.starts_with("multipart/related") {
-        parse_multipart_related(ct, &body)?
+        .unwrap_or("")
+        .to_string();
+    let (mut doc, spools) = if ct.starts_with("multipart/related") {
+        // Streamed: attachment parts spool to disk, only the JSON part
+        // (and a boundary-sized carry) ever lives in memory.
+        let parsed = parse_multipart_stream(&ct, request.into_body(), &state.dir).await?;
+        let spools = match_parts_to_atts(&parsed.doc, parsed.parts)?;
+        (parsed.doc, spools)
     } else {
-        parse_json(&body)?
+        let body = axum::body::to_bytes(request.into_body(), JSON_BODY_LIMIT)
+            .await
+            .map_err(|e| ApiError::bad_request(format!("body read failed: {e}")))?;
+        (parse_json(&body)?, Vec::new())
     };
     if let Some(obj) = doc.as_object_mut() {
         obj.insert("_id".into(), Value::String(docid.clone()));
     }
-    write_doc(&state, &db, doc, &q, &headers)
+    write_doc_with_spools(&state, &db, doc, spools, &q, &headers)
+}
+
+/// Zip multipart body parts with the doc's `follows` attachments in JSON
+/// order — the couch_doc wire contract couch-repl and the Erlang replicator
+/// both emit (serde_json preserves object order here).
+fn match_parts_to_atts(
+    doc: &Value,
+    parts: Vec<crate::spool::Spool>,
+) -> ApiResult<Vec<SpooledAtt>> {
+    let follows: Vec<(String, String)> = doc
+        .get("_attachments")
+        .and_then(|a| a.as_object())
+        .map(|atts| {
+            atts.iter()
+                .filter(|(_, spec)| spec.get("follows") == Some(&Value::Bool(true)))
+                .map(|(name, spec)| {
+                    (
+                        name.clone(),
+                        spec.get("content_type")
+                            .and_then(|c| c.as_str())
+                            .unwrap_or("application/octet-stream")
+                            .to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if follows.len() != parts.len() {
+        return Err(ApiError::bad_request(format!(
+            "multipart part count mismatch: {} follows attachments, {} body parts",
+            follows.len(),
+            parts.len()
+        )));
+    }
+    Ok(follows
+        .into_iter()
+        .zip(parts)
+        .map(|((name, ct), spool)| spool.into_att(name, ct))
+        .collect())
 }
 
 pub async fn doc_post(
@@ -414,9 +478,9 @@ pub async fn design_put(
     Path((db, name)): Path<(String, String)>,
     q: Query<Q>,
     headers: HeaderMap,
-    body: bytes::Bytes,
+    request: Request,
 ) -> ApiResult<Response> {
-    doc_put(state, Path((db, format!("_design/{name}"))), q, headers, body).await
+    doc_put(state, Path((db, format!("_design/{name}"))), q, headers, request).await
 }
 
 pub async fn design_delete(
@@ -441,9 +505,9 @@ pub async fn design_att_put(
     Path((db, name, att)): Path<(String, String, String)>,
     q: Query<Q>,
     headers: HeaderMap,
-    body: bytes::Bytes,
+    request: Request,
 ) -> ApiResult<Response> {
-    att_put(state, Path((db, format!("_design/{name}"), att)), q, headers, body).await
+    att_put(state, Path((db, format!("_design/{name}"), att)), q, headers, request).await
 }
 
 pub async fn design_att_delete(
@@ -489,16 +553,91 @@ pub async fn att_get(
         let Some(ai) = summary.atts.iter().find(|a| a.name == att) else {
             return Err(ApiError::not_found("Document is missing attachment"));
         };
-        let data = docmod::read_att_data_decoded(&snap.file, ai)?;
-        let mut resp = Response::new(axum::body::Body::from(data));
+
+        // Stream the attachment chunk-by-chunk: peak memory is one stored
+        // chunk, not the attachment. The snapshot Arc keeps the file open
+        // even if the db swaps snapshots or compacts mid-download.
+        let ai = ai.clone();
+        let gzip_encoded = ai.encoding == "gzip";
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+        let pump_snap = snap.clone();
+        tokio::task::spawn_blocking(move || {
+            let send = |data: Vec<u8>| tx.blocking_send(Ok(bytes::Bytes::from(data))).is_ok();
+            let fail = |msg: String| {
+                let _ = tx.blocking_send(Err(std::io::Error::other(msg)));
+            };
+            if gzip_encoded {
+                // Stored gzip (stock-written files): decode as it streams.
+                let mut dec = flate2::write::GzDecoder::new(ChannelWriter {
+                    tx: tx.clone(),
+                    failed: false,
+                });
+                use std::io::Write;
+                for (pos, _len) in &ai.chunks {
+                    match pump_snap.file.read_chunk(*pos) {
+                        Ok(data) => {
+                            if dec.write_all(&data).is_err() {
+                                return fail("gunzip attachment failed".into());
+                            }
+                        }
+                        Err(e) => return fail(format!("attachment read failed: {e}")),
+                    }
+                }
+                let _ = dec.finish();
+            } else {
+                for (pos, _len) in &ai.chunks {
+                    match pump_snap.file.read_chunk(*pos) {
+                        Ok(data) => {
+                            if !send(data) {
+                                return; // client went away
+                            }
+                        }
+                        Err(e) => return fail(format!("attachment read failed: {e}")),
+                    }
+                }
+            }
+        });
+
+        let mut resp = Response::new(axum::body::Body::from_stream(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        ));
         resp.headers_mut().insert(
             header::CONTENT_TYPE,
             header::HeaderValue::from_str(&ai.content_type)
                 .unwrap_or(header::HeaderValue::from_static("application/octet-stream")),
         );
+        if !gzip_encoded {
+            // Identity: the stored length is the wire length.
+            resp.headers_mut()
+                .insert(header::CONTENT_LENGTH, header::HeaderValue::from(ai.att_len));
+        }
         resp.headers_mut().insert(header::ETAG, etag(&rev_str));
         Ok(resp)
     })
+}
+
+/// io::Write adapter feeding decoded bytes into the response channel.
+struct ChannelWriter {
+    tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    failed: bool,
+}
+
+impl std::io::Write for ChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.failed
+            || self
+                .tx
+                .blocking_send(Ok(bytes::Bytes::copy_from_slice(buf)))
+                .is_err()
+        {
+            self.failed = true;
+            return Err(std::io::Error::other("client went away"));
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Rebuild the doc with existing attachments as stubs, applying one change
@@ -509,6 +648,7 @@ fn modify_atts(
     docid: &str,
     rev: Option<&str>,
     success: StatusCode,
+    spools: Vec<SpooledAtt>,
     change: impl FnOnce(&mut Map<String, Value>) -> ApiResult<()>,
 ) -> ApiResult<Response> {
     let dbh = state.db(db)?;
@@ -537,7 +677,7 @@ fn modify_atts(
         change(atts)?;
     }
     let validator = state.validator_for(db);
-    let outcome = dbh.with_writer(|w| w.save_doc(&doc, validator))?;
+    let outcome = dbh.with_writer(|w| w.save_doc_with_spools(&doc, validator, spools))?;
     match outcome {
         SaveOutcome::Ok { rev } => Ok(ok_status(success, docid, &rev)),
         SaveOutcome::Error { error, reason } => Err(ApiError::from_save(&error, &reason)),
@@ -549,7 +689,7 @@ pub async fn att_put(
     Path((db, docid, att)): Path<(String, String, String)>,
     Query(q): Query<Q>,
     headers: HeaderMap,
-    body: bytes::Bytes,
+    request: Request,
 ) -> ApiResult<Response> {
     let rev = q.get("rev").cloned().or_else(|| {
         headers
@@ -562,17 +702,22 @@ pub async fn att_put(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_string();
+    // Stream the body to a spool — attachment size never touches RAM.
+    let spool = spool_body(request.into_body(), &state.dir).await?;
+    let spooled = spool.into_att(att.clone(), ct.clone());
     blocking(move || {
-        modify_atts(&state, &db, &docid, rev.as_deref(), StatusCode::CREATED, move |atts| {
-            atts.insert(
-                att,
-                json!({
-                    "content_type": ct,
-                    "data": base64::engine::general_purpose::STANDARD.encode(&body),
-                }),
-            );
-            Ok(())
-        })
+        modify_atts(
+            &state,
+            &db,
+            &docid,
+            rev.as_deref(),
+            StatusCode::CREATED,
+            vec![spooled],
+            move |atts| {
+                atts.insert(att, json!({ "content_type": ct }));
+                Ok(())
+            },
+        )
     })
 }
 
@@ -589,7 +734,7 @@ pub async fn att_delete(
             .map(|s| s.trim_matches('"').to_string())
     });
     blocking(move || {
-        modify_atts(&state, &db, &docid, rev.as_deref(), StatusCode::OK, move |atts| {
+        modify_atts(&state, &db, &docid, rev.as_deref(), StatusCode::OK, Vec::new(), move |atts| {
             if atts.remove(&att).is_none() {
                 return Err(ApiError::not_found("Document is missing attachment"));
             }

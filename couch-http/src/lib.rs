@@ -16,6 +16,7 @@ pub mod error;
 pub mod jsfilter;
 pub mod metrics;
 pub mod repl;
+pub mod spool;
 pub mod state;
 pub mod ui;
 pub mod util;

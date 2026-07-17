@@ -1359,3 +1359,113 @@ async fn replication_through_gzip_transport() {
     assert_eq!(r.status().as_u16(), 200);
     assert_eq!(r.text().await.unwrap(), csv);
 }
+
+/// Large attachments stream disk-to-disk: an 8 MiB body PUT as a stream,
+/// stored as bounded chunks, served back with content-length, correct
+/// through compaction and through replication to a second server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn streaming_attachment_roundtrip() {
+    let srv = start(None, false).await;
+    let c = client();
+    let b = &srv.base;
+    jput(&c, &format!("{b}/big"), &json!({})).await;
+
+    // Patterned 8 MiB payload, uploaded as a 64 KiB-chunk stream.
+    let data: Vec<u8> = (0..8 * 1024 * 1024u32).map(|i| (i % 249) as u8).collect();
+    let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = data
+        .chunks(64 * 1024)
+        .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
+        .collect();
+    let (s, v) = jput(&c, &format!("{b}/big/carrier"), &json!({"kind": "video"})).await;
+    assert_eq!(s, 201);
+    let rev = v["rev"].as_str().unwrap().to_string();
+    let r = c
+        .put(format!("{b}/big/carrier/blob.bin?rev={rev}"))
+        .header("content-type", "application/octet-stream")
+        .body(reqwest::Body::wrap_stream(futures_stream_iter(chunks)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 201);
+
+    // GET: identity attachment streams back with an exact content-length.
+    let r = c.get(format!("{b}/big/carrier/blob.bin")).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(
+        r.headers().get("content-length").and_then(|v| v.to_str().ok()),
+        Some(data.len().to_string().as_str())
+    );
+    let got = r.bytes().await.unwrap();
+    assert_eq!(&got[..], &data[..], "roundtrip bytes differ");
+
+    // The stored form is bounded chunks, not one blob.
+    let (_, doc) = jget(&c, &format!("{b}/big/carrier")).await;
+    assert_eq!(doc["_attachments"]["blob.bin"]["length"], json!(data.len()));
+
+    // Compaction re-chunks and must preserve every byte.
+    let r = c
+        .post(format!("{b}/big/_compact"))
+        .header("content-type", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 202);
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (_, info) = jget(&c, &format!("{b}/big")).await;
+        if info["compact_running"] == json!(false) {
+            break;
+        }
+    }
+    let got = c
+        .get(format!("{b}/big/carrier/blob.bin"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&got[..], &data[..], "post-compaction bytes differ");
+
+    // Replicate to a second server: the attachment lane streams it across
+    // (multipart PUT through the streaming parser on the target).
+    let tgt = start(None, false).await;
+    let (s, _) = jput(
+        &c,
+        &format!("{b}/_replicator/bigjob"),
+        &json!({
+            "source": format!("{b}/big"),
+            "target": format!("{}/big", tgt.base),
+            "create_target": true,
+        }),
+    )
+    .await;
+    assert_eq!(s, 201);
+    let mut state = String::new();
+    for _ in 0..150 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (s, v) = jget(&c, &format!("{b}/_scheduler/docs/_replicator/bigjob")).await;
+        if s == 200 {
+            state = v["state"].as_str().unwrap_or("").to_string();
+            if state == "completed" || state == "failed" {
+                break;
+            }
+        }
+    }
+    assert_eq!(state, "completed");
+    let got = c
+        .get(format!("{}/big/carrier/blob.bin", tgt.base))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&got[..], &data[..], "replicated bytes differ");
+}
+
+fn futures_stream_iter(
+    chunks: Vec<Result<bytes::Bytes, std::io::Error>>,
+) -> impl futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> {
+    futures::stream::iter(chunks)
+}

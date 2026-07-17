@@ -34,6 +34,11 @@ OpenSSL; runs on ARM Linux).
   quadtree instead of a full scan. The definition lives in a
   `language: "query"` design doc section that stock CouchDB ignores, so
   databases carrying spatial indexes still replicate to Erlang peers.
+- Attachments stream disk-to-disk in both directions like couch_stream:
+  uploads (raw PUT and replicator multipart) spool to a temp file and
+  land in the .couch file in 1 MiB chunks; downloads stream the stored
+  chunk list. A 300 MB attachment transfer holds the server around
+  25–50 MB RSS. Size is unbounded (stock's max_attachment_size default).
 - HTTP gzip, negotiated per request (stock CouchDB compresses neither
   direction of replication traffic). Responses compress only for clients
   sending `Accept-Encoding: gzip` (`feed=continuous` always stays identity

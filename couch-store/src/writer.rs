@@ -25,6 +25,26 @@ pub struct NewAtt {
     pub revpos: Option<u64>,
 }
 
+/// Attachment bytes spooled to a temp file by the HTTP layer, copied into
+/// the db file in [`ATT_CHUNK_SIZE`] chunks at commit — RAM use never
+/// scales with attachment size (couch_stream's write model).
+pub struct SpooledAtt {
+    pub name: String,
+    pub content_type: String,
+    /// See [`NewAtt::revpos`].
+    pub revpos: Option<u64>,
+    /// The spooled bytes; read from offset 0 at write time.
+    pub file: std::fs::File,
+    pub len: u64,
+    /// md5 of the spooled bytes (computed while spooling).
+    pub md5: Vec<u8>,
+}
+
+/// Chunk size for attachment data written from spools (and for re-chunking
+/// oversized legacy chunks during compaction). Bounds peak memory per
+/// attachment transfer.
+pub const ATT_CHUNK_SIZE: usize = 1024 * 1024;
+
 /// Placeholder leaf seq until the batch assigns per-doc seqs.
 const PENDING_SEQ: u64 = u64::MAX;
 
@@ -51,6 +71,7 @@ fn assign_pending_seqs(tree: &mut RevTree, seq: u64) {
 /// attachments without rewriting them).
 pub enum AttInput {
     Inline(NewAtt),
+    Spooled(SpooledAtt),
     Existing {
         /// The full attachment disk term, reused verbatim.
         term: Term,
@@ -73,7 +94,15 @@ impl DocUpdate {
     /// Build a DocUpdate from a full JSON doc (`_id`, optional `_rev` /
     /// `_revisions` / `_deleted` / `_attachments` with base64 `data`).
     /// Docs without a rev get a deterministic generated 1-rev.
-    pub fn from_json(mut v: Value) -> Result<DocUpdate> {
+    pub fn from_json(v: Value) -> Result<DocUpdate> {
+        Self::from_json_with_spools(v, Vec::new())
+    }
+
+    /// Like [`DocUpdate::from_json`], with out-of-band attachment bytes:
+    /// an `_attachments` entry whose name matches a spool takes its data
+    /// from the spool (streamed multipart PUTs), overriding the inline
+    /// `data` requirement. Every spool must be claimed by an entry.
+    pub fn from_json_with_spools(mut v: Value, spools: Vec<SpooledAtt>) -> Result<DocUpdate> {
         let obj = v
             .as_object_mut()
             .ok_or_else(|| Error::BadRequest("doc is not an object".into()))?;
@@ -91,10 +120,21 @@ impl DocUpdate {
         obj.remove("_revs_info");
         obj.remove("_local_seq");
 
+        let mut spool_map: std::collections::HashMap<String, SpooledAtt> =
+            spools.into_iter().map(|s| (s.name.clone(), s)).collect();
         let mut atts = Vec::new();
         if let Some(Value::Object(am)) = atts_json {
             use base64::Engine;
             for (name, spec) in am {
+                if let Some(mut spool) = spool_map.remove(&name) {
+                    if let Some(ct) = spec.get("content_type").and_then(|c| c.as_str()) {
+                        spool.content_type = ct.to_string();
+                    }
+                    let revpos = spec.get("revpos").and_then(|r| r.as_u64());
+                    spool.revpos = Some(revpos.unwrap_or(0));
+                    atts.push(AttInput::Spooled(spool));
+                    continue;
+                }
                 let data = spec
                     .get("data")
                     .and_then(|d| d.as_str())
@@ -119,6 +159,11 @@ impl DocUpdate {
                     revpos: Some(revpos.unwrap_or(0)),
                 }));
             }
+        }
+        if let Some(name) = spool_map.keys().next() {
+            return Err(Error::BadRequest(format!(
+                "attachment part {name} not referenced by _attachments"
+            )));
         }
 
         let rev_path = if let Some(revs) = revisions {
@@ -326,6 +371,40 @@ impl DbWriter {
                         leaf_att_sizes
                             .push(Term::Tuple(vec![sp, Term::Int(att.data.len() as i64)]));
                     }
+                    AttInput::Spooled(att) => {
+                        use std::io::{Read, Seek, SeekFrom};
+                        let mut f = &att.file;
+                        f.seek(SeekFrom::Start(0))?;
+                        let mut chunks: Vec<(u64, Option<u64>)> = Vec::new();
+                        let mut remaining = att.len;
+                        let mut buf = vec![0u8; ATT_CHUNK_SIZE.min(att.len.max(1) as usize)];
+                        while remaining > 0 {
+                            let want = remaining.min(ATT_CHUNK_SIZE as u64) as usize;
+                            f.read_exact(&mut buf[..want])?;
+                            let (chunk_pos, _) = self.file.append_chunk(&buf[..want])?;
+                            chunks.push((chunk_pos, Some(want as u64)));
+                            remaining -= want as u64;
+                        }
+                        if chunks.is_empty() {
+                            // Zero-length attachments keep one (empty) chunk,
+                            // like the inline path always wrote.
+                            let (chunk_pos, _) = self.file.append_chunk(&[])?;
+                            chunks.push((chunk_pos, Some(0)));
+                        }
+                        let sp = sp_term(&chunks);
+                        let revpos = att.revpos.unwrap_or(*pos);
+                        att_terms.push(Term::Tuple(vec![
+                            Term::Bin(att.name.as_bytes().to_vec()),
+                            Term::Bin(att.content_type.as_bytes().to_vec()),
+                            sp.clone(),
+                            Term::Int(att.len as i64),
+                            Term::Int(att.len as i64),
+                            Term::Int(revpos as i64),
+                            Term::Bin(att.md5.clone()),
+                            Term::atom("identity"),
+                        ]));
+                        leaf_att_sizes.push(Term::Tuple(vec![sp, Term::Int(att.len as i64)]));
+                    }
                     AttInput::Existing { term, sp, disk_len } => {
                         att_terms.push(term.clone());
                         leaf_att_sizes
@@ -402,6 +481,19 @@ impl DbWriter {
     /// parent revision, and runs an optional validation hook against the old
     /// winner. Never creates conflicts.
     pub fn save_doc(&mut self, doc: &Value, validate: Option<Validator<'_>>) -> Result<SaveOutcome> {
+        self.save_doc_with_spools(doc, validate, Vec::new())
+    }
+
+    /// [`DbWriter::save_doc`] with out-of-band attachment bytes: an
+    /// `_attachments` entry whose name matches a spool takes its data from
+    /// the spool (streamed attachment PUTs) instead of inline base64 or a
+    /// parent stub.
+    pub fn save_doc_with_spools(
+        &mut self,
+        doc: &Value,
+        validate: Option<Validator<'_>>,
+        spools: Vec<SpooledAtt>,
+    ) -> Result<SaveOutcome> {
         let obj = doc
             .as_object()
             .ok_or_else(|| Error::BadRequest("doc is not an object".into()))?;
@@ -505,10 +597,23 @@ impl DbWriter {
             Some((_, _, Some(ptr), _)) => Some(doc::read_summary(&self.file, *ptr)?),
             _ => None,
         };
+        let mut spool_map: std::collections::HashMap<String, SpooledAtt> =
+            spools.into_iter().map(|s| (s.name.clone(), s)).collect();
         let mut atts = Vec::new();
         let mut att_digest = Md5::new();
         if let Some(Value::Object(am)) = obj.get("_attachments") {
             for (name, spec) in am {
+                if let Some(mut spool) = spool_map.remove(name) {
+                    if let Some(ct) = spec.get("content_type").and_then(|c| c.as_str()) {
+                        spool.content_type = ct.to_string();
+                    }
+                    att_digest.update(name.as_bytes());
+                    att_digest.update(&spool.md5);
+                    // revpos: None → the doc's new rev pos, like fresh inline.
+                    spool.revpos = None;
+                    atts.push(AttInput::Spooled(spool));
+                    continue;
+                }
                 let is_stub = matches!(spec.get("stub"), Some(Value::Bool(true)))
                     || matches!(spec.get("follows"), Some(Value::Bool(true)));
                 if is_stub {
@@ -555,6 +660,11 @@ impl DbWriter {
                     }));
                 }
             }
+        }
+        if let Some(name) = spool_map.keys().next() {
+            return Err(Error::BadRequest(format!(
+                "attachment part {name} not referenced by _attachments"
+            )));
         }
 
         // Deterministic new revid, like couch_db:new_revid: a digest over the
@@ -1093,5 +1203,88 @@ mod tests {
         let back = crate::doc::read_att_data(&db.file, att).unwrap();
         assert_eq!(back, data);
         assert_eq!(att.md5, Md5::digest(&data).to_vec());
+    }
+
+    /// Spooled attachments: multi-chunk write from a temp file, byte-exact
+    /// read-back, and survival through compaction (which re-chunks).
+    #[test]
+    fn spooled_attachment_roundtrip_and_compact() {
+        use std::io::{Seek, SeekFrom, Write};
+        let path = tmppath("spool.couch");
+
+        // 2.5 MiB patterned payload -> 3 chunks at ATT_CHUNK_SIZE.
+        let data: Vec<u8> = (0..(2 * ATT_CHUNK_SIZE + ATT_CHUNK_SIZE / 2))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut spool = tempfile::tempfile().unwrap();
+        spool.write_all(&data).unwrap();
+        spool.seek(SeekFrom::Start(0)).unwrap();
+        let md5 = Md5::digest(&data).to_vec();
+
+        {
+            let mut w = DbWriter::create(&path).unwrap();
+            let outcome = w
+                .save_doc_with_spools(
+                    &json!({"_id": "big", "kind": "carrier",
+                            "_attachments": {"blob.bin": {"content_type": "application/octet-stream"}}}),
+                    None,
+                    vec![SpooledAtt {
+                        name: "blob.bin".into(),
+                        content_type: "application/octet-stream".into(),
+                        revpos: None,
+                        file: spool,
+                        len: data.len() as u64,
+                        md5: md5.clone(),
+                    }],
+                )
+                .unwrap();
+            assert!(matches!(outcome, SaveOutcome::Ok { .. }));
+
+            // Zero-length spool.
+            let empty = tempfile::tempfile().unwrap();
+            let outcome = w
+                .save_doc_with_spools(
+                    &json!({"_id": "empty", "_attachments": {"none.txt": {"content_type": "text/plain"}}}),
+                    None,
+                    vec![SpooledAtt {
+                        name: "none.txt".into(),
+                        content_type: "text/plain".into(),
+                        revpos: None,
+                        file: empty,
+                        len: 0,
+                        md5: Md5::digest([]).to_vec(),
+                    }],
+                )
+                .unwrap();
+            assert!(matches!(outcome, SaveOutcome::Ok { .. }));
+            w.commit().unwrap();
+        }
+
+        let check = |path: &str| {
+            let db = Db::open(path).unwrap();
+            let fdi = db.open_doc_info(b"big").unwrap().unwrap();
+            let leaf = fdi.rev_tree.winner().unwrap();
+            let crate::revtree::RevVal::Leaf(lv) = leaf.leaf else { panic!() };
+            let summary = crate::doc::read_summary(&db.file, lv.ptr.unwrap()).unwrap();
+            let att = &summary.atts[0];
+            assert!(att.chunks.len() >= 3, "expected multi-chunk, got {}", att.chunks.len());
+            assert_eq!(att.att_len, 2_621_440); // 2.5 MiB
+            assert_eq!(att.md5, Md5::digest(
+                crate::doc::read_att_data(&db.file, att).unwrap()
+            ).to_vec());
+            assert_eq!(crate::doc::read_att_data(&db.file, att).unwrap().len(), att.att_len as usize);
+
+            let fdi = db.open_doc_info(b"empty").unwrap().unwrap();
+            let leaf = fdi.rev_tree.winner().unwrap();
+            let crate::revtree::RevVal::Leaf(lv) = leaf.leaf else { panic!() };
+            let summary = crate::doc::read_summary(&db.file, lv.ptr.unwrap()).unwrap();
+            assert_eq!(crate::doc::read_att_data(&db.file, &summary.atts[0]).unwrap(), b"");
+        };
+        check(&path);
+
+        // Compact (in place) and re-verify: the chunked copy must preserve
+        // every byte.
+        crate::compact::compact(&path).unwrap();
+        check(&path);
     }
 }

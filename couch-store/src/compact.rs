@@ -342,13 +342,38 @@ fn copy_node_inner(
             let mut att_terms = Vec::new();
             let mut leaf_att_sizes = Vec::new();
             for att in &summary.atts {
-                let data = doc::read_att_data(src, att)?;
-                let (new_pos, _) = dst.append_chunk(&data)?;
+                // Copy chunk-by-chunk — never the whole attachment in RAM —
+                // and split oversized legacy single-chunk attachments while
+                // at it, so the copy stays bounded on every future compact.
+                let mut new_chunks: Vec<(u64, Option<u64>)> = Vec::new();
+                for (pos, _len) in &att.chunks {
+                    let data = src.read_chunk(*pos)?;
+                    if data.is_empty() {
+                        let (new_pos, _) = dst.append_chunk(&[])?;
+                        new_chunks.push((new_pos, Some(0)));
+                        continue;
+                    }
+                    for piece in data.chunks(crate::writer::ATT_CHUNK_SIZE) {
+                        let (new_pos, _) = dst.append_chunk(piece)?;
+                        new_chunks.push((new_pos, Some(piece.len() as u64)));
+                    }
+                }
+                if new_chunks.is_empty() {
+                    let (new_pos, _) = dst.append_chunk(&[])?;
+                    new_chunks.push((new_pos, Some(0)));
+                }
                 *atts_copied += 1;
-                let sp = Term::List(vec![Term::Tuple(vec![
-                    Term::Int(new_pos as i64),
-                    Term::Int(data.len() as i64),
-                ])]);
+                let sp = Term::List(
+                    new_chunks
+                        .iter()
+                        .map(|(p, l)| {
+                            Term::Tuple(vec![
+                                Term::Int(*p as i64),
+                                Term::Int(l.unwrap_or(0) as i64),
+                            ])
+                        })
+                        .collect(),
+                );
                 att_terms.push(Term::Tuple(vec![
                     Term::Bin(att.name.as_bytes().to_vec()),
                     Term::Bin(att.content_type.as_bytes().to_vec()),

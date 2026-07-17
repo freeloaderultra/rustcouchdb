@@ -398,6 +398,7 @@ dependencies = [
  "serde_json",
  "snap",
  "stacker",
+ "tempfile",
  "xxhash-rust",
 ]
 
