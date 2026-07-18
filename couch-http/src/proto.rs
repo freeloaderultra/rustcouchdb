@@ -334,6 +334,35 @@ pub fn render_if_envelope(
     }
 }
 
+/// Query-result body negotiation. A proto-aware client sends
+/// `X-Proto-Bodies: true` to receive documents as the stored `$pb`
+/// envelope (raw message bytes, base64 in the JSON result) and decode them
+/// itself — no server-side proto→JSON re-render, no client-side protojson.
+/// Absent (curl, Fauxton, stock-style consumers), results render to the
+/// readable JSON view. Single-doc GET negotiates the same choice through
+/// `Accept: application/protobuf`.
+pub fn wants_proto_bodies(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("x-proto-bodies")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+}
+
+/// A query-result doc for the given body-format choice: the stored envelope
+/// verbatim when the client wants proto bodies, otherwise the rendered view.
+pub fn present_doc(
+    reg: Option<&Registry>,
+    doc: Value,
+    proto_bodies: bool,
+) -> Result<Value, couch_store::error::Error> {
+    if proto_bodies {
+        Ok(doc)
+    } else {
+        render_if_envelope(reg, doc)
+    }
+}
+
 /// Decoded (or extracted) message fields plus the doc's `_*` metadata —
 /// `$pb_*` deliberately not carried over.
 fn meta_over(decoded: Value, doc: &Value) -> Value {

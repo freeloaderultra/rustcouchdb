@@ -1761,6 +1761,11 @@ async fn proto_schema_mango() {
     assert_eq!(ids(&v), vec!["lg1"]);
 }
 
+fn base64_decode(s: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+}
+
 fn pb_bytes_long(field: u32, data: &[u8]) -> Vec<u8> {
     let mut b = Vec::new();
     let mut v = ((field as u64) << 3) | 2;
@@ -2001,6 +2006,22 @@ async fn proto_native_documents() {
     let (_, v) = jget(&c, &format!("{b}/pn/_all_docs?include_docs=true")).await;
     let doc = v["rows"].as_array().unwrap().iter().find(|r| r["id"] == "f1").unwrap();
     assert_eq!(doc["doc"]["name"], json!("north"));
+
+    // Proto-body negotiation: a proto-aware client asks for stored $pb
+    // envelopes (raw bytes, base64) instead of rendered views — no server
+    // re-render, no client protojson. The bytes decode to the same message.
+    let (s, v) = jpost(&c, &format!("{b}/pn/_find"),
+        &json!({"selector": {"area": {"$gte": 100}}, "proto_bodies": true, "limit": 10})).await;
+    assert_eq!(s, 200);
+    let f2 = v["docs"].as_array().unwrap().iter().find(|d| d["_id"] == "f2").unwrap();
+    assert_eq!(f2["$pb_type"], json!("test.v1.FieldBoundary"), "want envelope, got {f2}");
+    assert!(f2.get("area").is_none(), "envelope must not be pre-rendered");
+    let raw = base64_decode(f2["$pb_body"].as_str().unwrap());
+    assert_eq!(raw, boundary_blob("f2", 150.0, 1.0, 2.0, 9));
+    // _all_docs and _changes honor the query-param form.
+    let (_, v) = jget(&c, &format!("{b}/pn/_all_docs?include_docs=true&proto_bodies=true")).await;
+    let doc = v["rows"].as_array().unwrap().iter().find(|r| r["id"] == "f2").unwrap();
+    assert_eq!(doc["doc"]["$pb_type"], json!("test.v1.FieldBoundary"));
 
     // Delete produces a proto tombstone; the doc is then missing.
     let r = c.delete(format!("{b}/pn/f1?rev={rev1}")).send().await.unwrap();

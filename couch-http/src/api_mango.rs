@@ -221,11 +221,17 @@ pub async fn index_delete(
 pub async fn find(
     State(state): State<App>,
     Path(db): Path<String>,
+    headers: axum::http::HeaderMap,
     body: bytes::Bytes,
 ) -> ApiResult<Response> {
     let t0 = std::time::Instant::now();
     let v = parse_json(&body)?;
     let want_stats = matches!(v.get("execution_stats"), Some(Value::Bool(true)));
+    // Proto-body negotiation: a proto-aware client asks (via the request
+    // body flag — kivik-friendly — or the header) for stored $pb envelopes
+    // instead of rendered JSON views, and decodes the bytes itself.
+    let proto_bodies = matches!(v.get("proto_bodies"), Some(Value::Bool(true)))
+        || crate::proto::wants_proto_bodies(&headers);
     let dbh = state.db(&db)?;
     let fq = FindQuery::parse(&v)?;
     let selector = couch_mango::Selector::compile(&fq.selector)
@@ -280,7 +286,7 @@ pub async fn find(
                 // Bare proto-native results come back as the stored $pb
                 // envelope; render them to the domain view (projected
                 // results already went through the augmenter's view).
-                docs.push(crate::proto::render_if_envelope(registry.as_deref(), doc)?);
+                docs.push(crate::proto::present_doc(registry.as_deref(), doc, proto_bodies)?);
                 Ok(())
             },
         )?;

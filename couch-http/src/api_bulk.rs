@@ -350,6 +350,7 @@ async fn all_docs_inner(
     body: Option<Value>,
 ) -> ApiResult<Response> {
     let dbh = state.db(&db)?;
+    let proto_bodies = qbool(&q, "proto_bodies", false);
     let registry = if qbool(&q, "include_docs", false) {
         blocking(|| state.proto_registry())?
     } else {
@@ -397,7 +398,7 @@ async fn all_docs_inner(
                             } else {
                                 crate::metrics::bump(&crate::metrics::DATABASE_READS);
                                 match snap.open_doc(id.as_bytes(), None, &opts)? {
-                                    Some(d) => crate::proto::render_if_envelope(registry.as_deref(), d)?,
+                                    Some(d) => crate::proto::present_doc(registry.as_deref(), d, proto_bodies)?,
                                     None => Value::Null,
                                 }
                             };
@@ -463,7 +464,7 @@ async fn all_docs_inner(
                 if let Some(w) = fdi.rev_tree.winner() {
                     crate::metrics::bump(&crate::metrics::DATABASE_READS);
                     let raw = snap.doc_json(&fdi, &w, &opts)?;
-                    row["doc"] = crate::proto::render_if_envelope(registry.as_deref(), raw)?;
+                    row["doc"] = crate::proto::present_doc(registry.as_deref(), raw, proto_bodies)?;
                 }
             }
             rows.push(row);

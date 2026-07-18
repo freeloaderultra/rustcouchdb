@@ -42,6 +42,14 @@ fn arg(name: &str) -> Option<String> {
     None
 }
 
+/// Presence-only boolean flag (`--census`, `--skip-undecodable`), tolerant
+/// of a trailing position and of an `=true` form.
+fn flag(name: &str) -> bool {
+    std::env::args()
+        .skip(1)
+        .any(|a| a == format!("--{name}") || a.starts_with(&format!("--{name}=")))
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("migration failed: {e}");
@@ -50,7 +58,7 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let census = arg("census").is_some();
+    let census = flag("census");
     let source = arg("source").ok_or("--source <old .couch> required")?;
     let target = if census {
         String::new()
@@ -138,6 +146,16 @@ fn run() -> Result<(), String> {
         }
     }
 
+    // JSON docs that fail to re-encode against the current schema.
+    if !stats.reencode_fail.is_empty() {
+        eprintln!("\nRE-ENCODE FAILURES (JSON docs whose values don't fit the current schema):");
+        let mut dts: Vec<_> = stats.reencode_fail.iter().collect();
+        dts.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        for (dt, (n, sample, reason)) in dts {
+            eprintln!("  {dt}: {n} docs (e.g. {sample}: {reason})");
+        }
+    }
+
     // Blobs whose stored bytes no longer decode against the current schema.
     if !stats.undecodable.is_empty() {
         eprintln!("\nUNDECODABLE blobs (stored bytes wire-incompatible with current schema):");
@@ -146,13 +164,16 @@ fn run() -> Result<(), String> {
         for (dt, (n, sample)) in dts {
             eprintln!("  {dt}: {n} docs (e.g. {sample})");
         }
-        if !census && !skip_undecodable() {
-            return Err(
-                "some blobs do not decode against the current schema; re-run with \
-                 --skip-undecodable to drop them, or fix the schema/data first"
-                    .into(),
-            );
-        }
+    }
+    if (!stats.undecodable.is_empty() || !stats.reencode_fail.is_empty())
+        && !census
+        && !skip_undecodable()
+    {
+        return Err(
+            "some documents do not fit the current schema; re-run with \
+             --skip-undecodable to drop them, or fix the schema/data first"
+                .into(),
+        );
     }
 
     // Unresolvable doctypes are a hard stop — their documents cannot be
@@ -164,11 +185,13 @@ fn run() -> Result<(), String> {
         for (dt, n) in dts {
             eprintln!("  {dt}: {n} docs");
         }
-        return Err(
-            "some documents' types are not in the provided schema; supply correct \
-             --doctypes mappings (or an updated descriptor set) and re-run"
-                .into(),
-        );
+        if !census && !skip_undecodable() {
+            return Err(
+                "some documents' types are not in the provided schema; supply correct \
+                 --doctypes mappings (or an updated descriptor set) and re-run"
+                    .into(),
+            );
+        }
     }
 
     if census {
@@ -211,6 +234,11 @@ struct Stats {
     /// decode against the current schema (a wire-incompatible field-type
     /// change over the data's lifetime).
     undecodable: HashMap<String, (u64, String)>,
+    /// doctype -> (count, sample id, sample reason) of JSON docs that fail
+    /// to re-encode against the current schema for a reason other than an
+    /// unknown field (invalid enum value from a string→enum retype, a value
+    /// out of range, etc.).
+    reencode_fail: HashMap<String, (u64, String, String)>,
 }
 
 fn migrate_one(
@@ -228,10 +256,17 @@ fn migrate_one(
             stats.ddocs += 1;
             return Ok(());
         }
-        let doc = src
+        let mut doc = src
             .open_doc(id_bytes, None, &Default::default())
             .map_err(|e| e.to_string())?
             .ok_or("design doc vanished")?;
+        // Write as a fresh create in the new db: the source rev has no
+        // ancestor here, so keeping it would (correctly) conflict.
+        if let Some(o) = doc.as_object_mut() {
+            o.remove("_rev");
+            o.remove("_revisions");
+            o.remove("_revs_info");
+        }
         match w.save_doc(&doc, None).map_err(|e| e.to_string())? {
             SaveOutcome::Ok { .. } => {
                 stats.ddocs += 1;
@@ -279,14 +314,31 @@ fn migrate_one(
             if let Some(obj) = view.as_object_mut() {
                 obj.retain(|k, _| !k.starts_with('_'));
             }
-            let (bytes, dropped) = reg.encode_message_lenient(&full_name, &view)?;
-            if !dropped.is_empty() {
-                let per = stats.dropped.entry(doctype.clone()).or_default();
-                for k in dropped {
-                    *per.entry(k).or_default() += 1;
+            match reg.encode_message_lenient(&full_name, &view) {
+                Ok((bytes, dropped)) => {
+                    if !dropped.is_empty() {
+                        let per = stats.dropped.entry(doctype.clone()).or_default();
+                        for k in dropped {
+                            *per.entry(k).or_default() += 1;
+                        }
+                    }
+                    bytes
+                }
+                Err(e) => {
+                    // Not fatal per-doc in census: enumerate the full extent
+                    // of the drift; the real run stops on it (below).
+                    let entry = stats.reencode_fail.entry(doctype.clone()).or_insert((
+                        0,
+                        id.to_string(),
+                        e.clone(),
+                    ));
+                    entry.0 += 1;
+                    if census || skip_undecodable() {
+                        return Ok(());
+                    }
+                    return Err(format!("cannot re-encode against {full_name}: {e}"));
                 }
             }
-            bytes
         };
 
         // Verify the bytes decode against the current schema. A failure
@@ -331,7 +383,7 @@ fn migrate_one(
 }
 
 fn skip_undecodable() -> bool {
-    arg("skip-undecodable").is_some()
+    flag("skip-undecodable")
 }
 
 fn gen_revid(id: &str, type_name: &str, bytes: &[u8]) -> Vec<u8> {

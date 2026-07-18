@@ -30,6 +30,9 @@ struct ChangesOpts {
     /// For proto-native docs: selector matching and include_docs work on
     /// the rendered domain view, never the raw envelope.
     registry: Option<Arc<couch_proto::Registry>>,
+    /// When set (`?proto_bodies=true`), include_docs emits the stored $pb
+    /// envelope for the client to decode, instead of a rendered view.
+    proto_bodies: bool,
 }
 
 fn parse_opts(q: &Q, body: &Value) -> ApiResult<ChangesOpts> {
@@ -79,6 +82,7 @@ fn parse_opts(q: &Q, body: &Value) -> ApiResult<ChangesOpts> {
         selector,
         limit: qu64(q, "limit").unwrap_or(u64::MAX).max(1),
         registry: None,
+        proto_bodies: qbool(q, "proto_bodies", false),
     })
 }
 
@@ -105,7 +109,7 @@ fn change_row(snap: &Db, fdi: &FullDocInfo, opts: &ChangesOpts) -> couch_store::
         };
         crate::metrics::bump(&crate::metrics::DATABASE_READS);
         let raw = snap.doc_json(fdi, &winner, &dopts)?;
-        Some(crate::proto::render_if_envelope(opts.registry.as_deref(), raw)?)
+        Some(crate::proto::present_doc(opts.registry.as_deref(), raw, opts.proto_bodies)?)
     } else {
         None
     };
