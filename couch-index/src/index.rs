@@ -228,7 +228,15 @@ impl Index {
                                     .iter()
                                     .any(|p| couch_mango::get_field(&doc, p).is_none()) =>
                         {
-                            f(db, &doc)
+                            // With no partial filter, only the indexed paths
+                            // matter — the augmenter can extract exactly
+                            // those from the blob instead of decoding it all.
+                            let wanted = if pfs.is_none() {
+                                Some(self.def.fields.as_slice())
+                            } else {
+                                None
+                            };
+                            f(db, &doc, wanted)?
                         }
                         _ => None,
                     };

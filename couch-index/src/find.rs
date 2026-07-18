@@ -210,7 +210,17 @@ pub struct FindStats {
 /// the doc is a decodable blob document, None otherwise. Selector matching
 /// and field projection run against the augmented view; docs emitted without
 /// a `fields` projection stay the stored JSON.
-pub type Augmenter<'a> = &'a dyn Fn(&Db, &Value) -> Option<Value>;
+///
+/// The third argument is the set of paths the caller will actually look at:
+/// `Some(paths)` lets the implementation extract just those fields from the
+/// blob's wire bytes (index updates); `None` demands the full decoded view
+/// (arbitrary selectors in _find).
+///
+/// `Ok(None)` means "not a decodable blob document" (no proto attachment,
+/// or its type has no registered schema) — the doc is matched as stored.
+/// Errors are real failures (corrupt data, unreadable attachment) and fail
+/// the operation; they are never downgraded to an opaque doc.
+pub type Augmenter<'a> = &'a dyn Fn(&Db, &Value, Option<&[String]>) -> Result<Option<Value>>;
 
 /// Execute the query, streaming result docs to `emit`. Takes the (already
 /// updated) index by reference rather than the Chosen borrow so callers can
@@ -237,7 +247,11 @@ where
         stats.docs_examined += 1;
         // Match against the augmented view when one exists — never against
         // the head alone, since added fields can flip $not-style clauses.
-        let view = augment.and_then(|f| f(db, &doc));
+        // Selectors and projections can touch arbitrary paths → full view.
+        let view = match augment {
+            Some(f) => f(db, &doc, None)?,
+            None => None,
+        };
         if !selector.matches(view.as_ref().unwrap_or(&doc)) {
             return Ok(ControlFlow::Continue(()));
         }

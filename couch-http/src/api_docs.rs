@@ -364,6 +364,10 @@ pub async fn doc_put(
     if let Some(obj) = doc.as_object_mut() {
         obj.insert("_id".into(), Value::String(docid.clone()));
     }
+    let interactive = q.get("new_edits").map(|v| v != "false").unwrap_or(true);
+    if interactive && db == crate::proto::SCHEMAS_DB {
+        crate::proto::validate_schemas_doc(&doc)?;
+    }
     write_doc_with_spools(&state, &db, doc, spools, &q, &headers)
 }
 
@@ -704,6 +708,9 @@ pub async fn att_put(
         .to_string();
     // Stream the body to a spool — attachment size never touches RAM.
     let spool = spool_body(request.into_body(), &state.dir).await?;
+    if db == crate::proto::SCHEMAS_DB {
+        crate::proto::validate_schemas_attachment(&spool)?;
+    }
     let spooled = spool.into_att(att.clone(), ct.clone());
     blocking(move || {
         modify_atts(

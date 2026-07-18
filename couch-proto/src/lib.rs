@@ -13,6 +13,9 @@
 //! omitted. That keeps blob-interior paths spelled exactly like their
 //! JSON-doc counterparts (`boundingBox.topLeft.latitude`).
 
+pub mod extract;
+pub use extract::{PathTrie, SkipRead, SliceReader};
+
 use prost::Message as _;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
 use serde_json::Value;
@@ -35,19 +38,23 @@ impl Registry {
     /// doctype→full-name overrides. Sets may arrive in any order and may
     /// share dependency files (duplicates are skipped by the pool); a set
     /// whose dependencies live in another set is retried after the rest.
-    /// Returns the registry and a list of non-fatal problems.
+    ///
+    /// Structural failures — bytes that aren't a `FileDescriptorSet`, or a
+    /// set whose dependencies no other set provides — are hard errors: a
+    /// registry must never be silently built from part of its inputs. The
+    /// returned strings are advisories (doctype naming collisions, override
+    /// targets not present) that don't affect what was registered.
     pub fn build(
         sets: &[Vec<u8>],
         overrides: &HashMap<String, String>,
-    ) -> (Registry, Vec<String>) {
+    ) -> Result<(Registry, Vec<String>), String> {
         let mut problems = Vec::new();
         let mut pool = DescriptorPool::new();
         let mut pending: Vec<prost_types::FileDescriptorSet> = Vec::new();
         for (i, bytes) in sets.iter().enumerate() {
-            match prost_types::FileDescriptorSet::decode(bytes.as_slice()) {
-                Ok(fds) => pending.push(fds),
-                Err(e) => problems.push(format!("descriptor set #{i}: not a FileDescriptorSet: {e}")),
-            }
+            let fds = prost_types::FileDescriptorSet::decode(bytes.as_slice())
+                .map_err(|e| format!("descriptor set #{i}: not a FileDescriptorSet: {e}"))?;
+            pending.push(fds);
         }
         // Cross-set dependencies resolve in <= sets.len() passes.
         loop {
@@ -63,10 +70,8 @@ impl Registry {
                 break;
             }
             if !progressed {
-                for (_, e) in still {
-                    problems.push(format!("descriptor set rejected: {e}"));
-                }
-                break;
+                let reasons: Vec<String> = still.into_iter().map(|(_, e)| e).collect();
+                return Err(format!("descriptor set(s) rejected: {}", reasons.join("; ")));
             }
             pending = still.into_iter().map(|(fds, _)| fds).collect();
         }
@@ -98,7 +103,7 @@ impl Registry {
                 )),
             }
         }
-        (Registry { by_doctype }, problems)
+        Ok((Registry { by_doctype }, problems))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -122,6 +127,17 @@ impl Registry {
             .map_err(|e| format!("cannot decode {doctype:?} as {}: {e}", desc.full_name()))?;
         serde_json::to_value(&msg).map_err(|e| format!("cannot JSON-encode {doctype:?}: {e}"))
     }
+}
+
+/// Cheap well-formedness check for a single descriptor-set upload: the
+/// bytes must decode as a `FileDescriptorSet`. Dependency resolution is
+/// deliberately NOT checked here — a set may depend on files provided by a
+/// different `_schemas` doc; that resolves (or errors, loudly) at registry
+/// build time.
+pub fn validate_descriptor_set(bytes: &[u8]) -> Result<(), String> {
+    prost_types::FileDescriptorSet::decode(bytes)
+        .map(|_| ())
+        .map_err(|e| format!("not a protobuf FileDescriptorSet: {e}"))
 }
 
 /// The `db.DocType` naming convention: snake_case of the message short name
@@ -177,7 +193,7 @@ pub fn blob_candidate(doc: &Value) -> Option<(&str, &str, u64)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use prost_reflect::Value as PbValue;
     use prost_types::{
@@ -211,7 +227,7 @@ mod tests {
     /// message FieldBoundary { string name = 1; double area = 2;
     ///                         repeated Point geo_points = 3; int64 big_count = 4;
     ///                         Point top_left = 5; }
-    fn test_descriptor_set() -> FileDescriptorSet {
+    pub(crate) fn test_descriptor_set() -> FileDescriptorSet {
         use field_descriptor_proto::Type;
         let point = DescriptorProto {
             name: Some("Point".into()),
@@ -243,9 +259,9 @@ mod tests {
         }
     }
 
-    fn encode_boundary(area: f64, lat: f64, lon: f64, big: i64) -> Vec<u8> {
+    pub(crate) fn encode_boundary(area: f64, lat: f64, lon: f64, big: i64) -> Vec<u8> {
         let (reg, problems) =
-            Registry::build(&[test_descriptor_set().encode_to_vec()], &HashMap::new());
+            Registry::build(&[test_descriptor_set().encode_to_vec()], &HashMap::new()).unwrap();
         assert!(problems.is_empty(), "{problems:?}");
         let desc = reg.resolve("field_boundary").unwrap().clone();
         let point = reg.resolve("point").unwrap().clone();
@@ -281,7 +297,7 @@ mod tests {
     #[test]
     fn decode_uses_protojson_conventions() {
         let (reg, problems) =
-            Registry::build(&[test_descriptor_set().encode_to_vec()], &HashMap::new());
+            Registry::build(&[test_descriptor_set().encode_to_vec()], &HashMap::new()).unwrap();
         assert!(problems.is_empty(), "{problems:?}");
         let bytes = encode_boundary(1234.5, 48.1, 11.5, 9007199254740993);
         let v = reg.decode_doc("field_boundary", &bytes).unwrap();
@@ -304,7 +320,7 @@ mod tests {
         let mut ov = HashMap::new();
         ov.insert("legacy_boundary".to_string(), "test.v1.FieldBoundary".to_string());
         ov.insert("missing".to_string(), "test.v1.Nope".to_string());
-        let (reg, problems) = Registry::build(&[test_descriptor_set().encode_to_vec()], &ov);
+        let (reg, problems) = Registry::build(&[test_descriptor_set().encode_to_vec()], &ov).unwrap();
         assert!(reg.resolve("legacy_boundary").is_some());
         assert!(reg.resolve("field_boundary").is_some());
         assert_eq!(problems.len(), 1, "{problems:?}");

@@ -233,7 +233,7 @@ pub async fn find(
 
     // Proto-blob awareness: with schemas registered, selectors, index keys
     // and projections can reach fields inside protobuf blob attachments.
-    let aug_fn = blocking(|| state.proto_registry()).map(crate::proto::augmenter);
+    let aug_fn = blocking(|| state.proto_registry())?.map(crate::proto::augmenter);
 
     // Serialize index-file writes: choosing, materializing and updating the
     // index happen under the per-db lock. The scan itself runs after the

@@ -6,7 +6,7 @@
 //! the EJSON body; Atts to a list of attachment disk terms.
 
 use crate::compress;
-use crate::error::{corrupt, Result};
+use crate::error::{corrupt, Error, Result};
 use crate::etf::{self, Term};
 use crate::file::CouchFile;
 use base64::Engine;
@@ -119,6 +119,111 @@ pub fn read_att_data(file: &CouchFile, att: &AttInfo) -> Result<Vec<u8>> {
         out.extend_from_slice(&file.read_chunk(*pos)?);
     }
     Ok(out)
+}
+
+/// Sequential reader over an attachment's stored chunk stream with cheap
+/// forward skips: chunks whose data length is known from the sp list are
+/// skipped by arithmetic — their bytes are never read from disk. Serves
+/// selective protobuf field extraction; use on identity-encoded
+/// attachments only (gzip streams can't skip).
+pub struct AttReader<'a> {
+    file: &'a CouchFile,
+    chunks: &'a [(u64, Option<u64>)],
+    idx: usize,
+    off: usize,
+    cur: Option<Vec<u8>>,
+    /// Chunks actually read from disk (observability + tests).
+    pub chunks_read: usize,
+}
+
+impl<'a> AttReader<'a> {
+    pub fn new(file: &'a CouchFile, att: &'a AttInfo) -> AttReader<'a> {
+        AttReader {
+            file,
+            chunks: &att.chunks,
+            idx: 0,
+            off: 0,
+            cur: None,
+            chunks_read: 0,
+        }
+    }
+
+    fn load(&mut self) -> Result<&[u8]> {
+        if self.cur.is_none() {
+            let data = self.file.read_chunk(self.chunks[self.idx].0)?;
+            if let Some(expect) = self.chunks[self.idx].1 {
+                if data.len() as u64 != expect {
+                    return Err(corrupt(format!(
+                        "attachment chunk {} length {} != sp length {expect}",
+                        self.idx,
+                        data.len()
+                    )));
+                }
+            }
+            self.chunks_read += 1;
+            self.cur = Some(data);
+        }
+        Ok(self.cur.as_deref().unwrap())
+    }
+
+    fn advance_chunk(&mut self) {
+        self.idx += 1;
+        self.off = 0;
+        self.cur = None;
+    }
+
+    pub fn read_exact(&mut self, mut buf: &mut [u8]) -> Result<()> {
+        while !buf.is_empty() {
+            if self.idx >= self.chunks.len() {
+                return Err(Error::BadRequest("read past end of attachment".into()));
+            }
+            let off = self.off;
+            let data = self.load()?;
+            let avail = data.len() - off;
+            if avail == 0 {
+                self.advance_chunk();
+                continue;
+            }
+            let take = avail.min(buf.len());
+            buf[..take].copy_from_slice(&data[off..off + take]);
+            buf = &mut buf[take..];
+            self.off += take;
+        }
+        Ok(())
+    }
+
+    pub fn skip(&mut self, mut n: u64) -> Result<()> {
+        while n > 0 {
+            if self.idx >= self.chunks.len() {
+                return Err(Error::BadRequest("skip past end of attachment".into()));
+            }
+            // Known-length chunk not yet loaded: skip by arithmetic.
+            if self.cur.is_none() {
+                if let Some(len) = self.chunks[self.idx].1 {
+                    let rest = len - self.off as u64;
+                    if n >= rest {
+                        n -= rest;
+                        self.advance_chunk();
+                        continue;
+                    }
+                    self.off += n as usize;
+                    return Ok(());
+                }
+            }
+            // Loaded (or unknown-length legacy) chunk: consume its data.
+            let off = self.off;
+            let data_len = self.load()?.len();
+            let rest = (data_len - off) as u64;
+            if n >= rest {
+                n -= rest;
+                self.advance_chunk();
+            } else {
+                self.off += n as usize;
+                n = 0;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Attachment data in identity form — gunzips server-side gzip encoding,

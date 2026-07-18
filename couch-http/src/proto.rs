@@ -26,88 +26,226 @@ pub const MAX_DECODE_BYTES: u64 = 64 * 1024 * 1024;
 /// Descriptor sets are small; cap reads defensively.
 const MAX_DESCRIPTOR_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Build a registry from a `_schemas` snapshot. Returns None when nothing
-/// usable is registered. Problems are logged, never fatal — a bad descriptor
-/// doc must not take Mango down.
-pub fn build_registry(snap: &Db) -> Option<Arc<Registry>> {
+/// Build a registry from a `_schemas` snapshot. Ok(None) means nothing is
+/// registered. Every structural problem — an unreadable or oversized
+/// attachment, bytes that aren't a FileDescriptorSet, unresolvable
+/// dependencies — is an error that fails the query which needed the
+/// registry: a registry silently built from part of its inputs would mask
+/// exactly the misconfiguration the operator needs to see. Only genuine
+/// advisories (doctype naming collisions, an override naming a message that
+/// isn't registered *yet*) are logged and tolerated.
+pub fn build_registry(snap: &Db) -> couch_store::error::Result<Option<Arc<Registry>>> {
     let mut sets: Vec<Vec<u8>> = Vec::new();
     let mut overrides: HashMap<String, String> = HashMap::new();
-    let walk = snap.fold_docs(|fdi| {
+    snap.fold_docs(|fdi| {
         if fdi.deleted || fdi.id.starts_with(b"_design/") {
             return Ok(ControlFlow::Continue(()));
         }
         let Some(w) = fdi.rev_tree.winner() else {
             return Ok(ControlFlow::Continue(()));
         };
+        let id = String::from_utf8_lossy(&fdi.id).into_owned();
         let doc = snap.doc_json(&fdi, &w, &Default::default())?;
-        if let Some(map) = doc.get("doctypes").and_then(|d| d.as_object()) {
+        if let Some(dt) = doc.get("doctypes") {
+            let map = dt.as_object().ok_or_else(|| {
+                couch_store::error::Error::Unsupported(format!(
+                    "_schemas/{id}: \"doctypes\" must be an object of doctype -> message name"
+                ))
+            })?;
             for (doctype, full) in map {
-                if let Some(full) = full.as_str() {
-                    overrides.insert(doctype.clone(), full.to_string());
-                }
+                let full = full.as_str().ok_or_else(|| {
+                    couch_store::error::Error::Unsupported(format!(
+                        "_schemas/{id}: doctypes[{doctype:?}] must be a string message name"
+                    ))
+                })?;
+                overrides.insert(doctype.clone(), full.to_string());
             }
         }
         if let Some(atts) = doc.get("_attachments").and_then(|a| a.as_object()) {
             for name in atts.keys() {
-                match snap.att_bytes(&fdi.id, name, MAX_DESCRIPTOR_BYTES) {
-                    Ok(Some(bytes)) => sets.push(bytes),
-                    Ok(None) => tracing::warn!(
-                        "_schemas/{}: attachment {name} missing or over {MAX_DESCRIPTOR_BYTES} bytes, skipped",
-                        String::from_utf8_lossy(&fdi.id)
-                    ),
-                    Err(e) => tracing::warn!(
-                        "_schemas/{}: cannot read attachment {name}: {e}",
-                        String::from_utf8_lossy(&fdi.id)
-                    ),
+                let att = snap.att_info(&fdi.id, name)?.ok_or_else(|| {
+                    couch_store::error::Error::Corrupt(format!(
+                        "_schemas/{id}: attachment {name} in stubs but not in summary"
+                    ))
+                })?;
+                if att.att_len > MAX_DESCRIPTOR_BYTES {
+                    return Err(couch_store::error::Error::Unsupported(format!(
+                        "_schemas/{id}: attachment {name} is {} bytes, over the \
+                         {MAX_DESCRIPTOR_BYTES}-byte descriptor limit",
+                        att.att_len
+                    )));
                 }
+                let bytes = snap.att_bytes(&fdi.id, name, MAX_DESCRIPTOR_BYTES)?.ok_or_else(
+                    || {
+                        couch_store::error::Error::Corrupt(format!(
+                            "_schemas/{id}: attachment {name} vanished from snapshot"
+                        ))
+                    },
+                )?;
+                sets.push(bytes);
             }
         }
         Ok(ControlFlow::Continue(()))
-    });
-    if let Err(e) = walk {
-        tracing::warn!("cannot scan _schemas: {e}");
-        return None;
-    }
+    })?;
     if sets.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let (reg, problems) = Registry::build(&sets, &overrides);
-    for p in &problems {
-        tracing::warn!("_schemas: {p}");
+    let (reg, advisories) = Registry::build(&sets, &overrides)
+        .map_err(|e| couch_store::error::Error::Unsupported(format!("_schemas: {e}")))?;
+    for a in &advisories {
+        tracing::warn!("_schemas: {a}");
     }
     if reg.is_empty() {
-        return None;
+        return Ok(None);
     }
     tracing::info!("proto registry loaded: {} doctypes", reg.len());
-    Some(Arc::new(reg))
+    Ok(Some(Arc::new(reg)))
+}
+
+/// Write-time gate for `PUT /_schemas/<doc>/<att>`: reject bytes that are
+/// not a FileDescriptorSet before they are stored, instead of discovering
+/// them when a query later needs the registry.
+pub fn validate_schemas_attachment(spool: &crate::spool::Spool) -> crate::error::ApiResult<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    if spool.len > MAX_DESCRIPTOR_BYTES {
+        return Err(crate::error::ApiError::bad_request(format!(
+            "descriptor set is {} bytes, over the {MAX_DESCRIPTOR_BYTES}-byte limit",
+            spool.len
+        )));
+    }
+    let mut f = &spool.file;
+    f.seek(SeekFrom::Start(0))
+        .map_err(|e| crate::error::ApiError::bad_request(format!("spool seek: {e}")))?;
+    let mut buf = Vec::with_capacity(spool.len as usize);
+    f.read_to_end(&mut buf)
+        .map_err(|e| crate::error::ApiError::bad_request(format!("spool read: {e}")))?;
+    f.seek(SeekFrom::Start(0))
+        .map_err(|e| crate::error::ApiError::bad_request(format!("spool seek: {e}")))?;
+    couch_proto::validate_descriptor_set(&buf).map_err(crate::error::ApiError::bad_request)
+}
+
+/// Write-time gate for interactive `PUT /_schemas/<doc>`: the `doctypes`
+/// mapping must be an object of strings, and inline base64 attachments must
+/// be FileDescriptorSets. (Replicated writes skip this — the source already
+/// validated, and a strict registry build backstops everything else.)
+pub fn validate_schemas_doc(doc: &Value) -> crate::error::ApiResult<()> {
+    use base64::Engine as _;
+    if let Some(dt) = doc.get("doctypes") {
+        let map = dt.as_object().ok_or_else(|| {
+            crate::error::ApiError::bad_request(
+                "\"doctypes\" must be an object mapping doctype to full message name",
+            )
+        })?;
+        for (doctype, full) in map {
+            if !full.is_string() {
+                return Err(crate::error::ApiError::bad_request(format!(
+                    "doctypes[{doctype:?}] must be a string message name"
+                )));
+            }
+        }
+    }
+    if let Some(atts) = doc.get("_attachments").and_then(|a| a.as_object()) {
+        for (name, spec) in atts {
+            if let Some(data) = spec.get("data").and_then(|d| d.as_str()) {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|e| {
+                        crate::error::ApiError::bad_request(format!("attachment {name}: bad base64: {e}"))
+                    })?;
+                couch_proto::validate_descriptor_set(&bytes).map_err(|e| {
+                    crate::error::ApiError::bad_request(format!("attachment {name}: {e}"))
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The Mango augmenter (see `couch_index::find::Augmenter`): resolves a
 /// doc's protobuf blob attachment through the registry and returns the
-/// decoded-and-overlaid view. Any failure (unknown type, oversized, decode
-/// error) leaves the doc opaque, exactly as if no schema were registered.
-pub fn augmenter(reg: Arc<Registry>) -> impl Fn(&Db, &Value) -> Option<Value> {
-    move |db, doc| {
-        let (att_name, doctype, len) = couch_proto::blob_candidate(doc)?;
-        if len > MAX_DECODE_BYTES {
-            return None;
-        }
-        reg.resolve(doctype)?;
-        let id = doc.get("_id")?.as_str()?;
-        let bytes = match db.att_bytes(id.as_bytes(), att_name, MAX_DECODE_BYTES) {
-            Ok(Some(b)) => b,
-            Ok(None) => return None,
-            Err(e) => {
-                tracing::debug!("proto augment: attachment read for {id} failed: {e}");
-                return None;
-            }
+/// decoded-and-overlaid view.
+///
+/// `Ok(None)` is reserved for docs that are simply not decodable blob
+/// documents by contract: no proto attachment, or a doctype with no
+/// registered schema. Everything failure-shaped — corrupt wire data, an
+/// attachment the snapshot's metadata promises but can't serve, a
+/// registered blob too large to decode — is an error and fails the
+/// operation. No fallbacks: a problem surfaces where it happens.
+///
+/// Two deterministic routes exist, decided from metadata BEFORE any data is
+/// touched (dispatch, not failure recovery): callers that name the paths
+/// they need get selective wire extraction (skipping unwanted fields and,
+/// with chunked storage, whole disk chunks) when the paths are navigable
+/// and the attachment is identity-encoded; otherwise the message is decoded
+/// in full. Both routes produce identical values for the same paths.
+pub fn augmenter(
+    reg: Arc<Registry>,
+) -> impl Fn(&Db, &Value, Option<&[String]>) -> couch_store::error::Result<Option<Value>> {
+    move |db, doc, wanted| {
+        let Some((att_name, doctype, _len)) = couch_proto::blob_candidate(doc) else {
+            return Ok(None);
         };
-        match reg.decode_doc(doctype, &bytes) {
-            Ok(decoded) => Some(couch_proto::overlay(decoded, doc)),
-            Err(e) => {
-                tracing::debug!("proto augment: {id}: {e}");
-                None
+        if reg.resolve(doctype).is_none() {
+            return Ok(None); // unregistered types stay opaque by contract
+        }
+        let id = doc
+            .get("_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| corrupt("blob doc without _id"))?
+            .to_string();
+        let att = db
+            .att_info(id.as_bytes(), att_name)?
+            .ok_or_else(|| corrupt(format!("{id}: attachment {att_name} in stubs but not in summary")))?;
+
+        // Route 1: selective extraction — paths known, navigable, and the
+        // stored stream is skippable (identity encoding).
+        if let Some(paths) = wanted {
+            let desc = reg.resolve(doctype).unwrap();
+            if att.encoding == "identity" {
+                if let Some(trie) = couch_proto::PathTrie::compile(desc, paths) {
+                    let mut reader = ChunkSkipRead(couch_store::doc::AttReader::new(&db.file, &att));
+                    let partial = trie.extract(&mut reader, att.att_len).map_err(|e| {
+                        corrupt(format!("{id}: extracting {paths:?} from {doctype}: {e}"))
+                    })?;
+                    return Ok(Some(couch_proto::overlay(partial, doc)));
+                }
             }
         }
+
+        // Route 2: full decode (arbitrary selectors, array-index paths,
+        // gzip-stored attachments). Decoding materializes the message in
+        // memory, hence the size bound — exceeding it is an error, not a
+        // silently unqueryable doc.
+        if att.att_len > MAX_DECODE_BYTES {
+            return Err(couch_store::error::Error::Unsupported(format!(
+                "{id}: {doctype} blob is {} bytes, over the {MAX_DECODE_BYTES}-byte full-decode limit",
+                att.att_len
+            )));
+        }
+        let bytes = db
+            .att_bytes(id.as_bytes(), att_name, MAX_DECODE_BYTES)?
+            .ok_or_else(|| corrupt(format!("{id}: attachment {att_name} vanished from snapshot")))?;
+        let decoded = reg
+            .decode_doc(doctype, &bytes)
+            .map_err(|e| corrupt(format!("{id}: {e}")))?;
+        Ok(Some(couch_proto::overlay(decoded, doc)))
+    }
+}
+
+fn corrupt(msg: impl Into<String>) -> couch_store::error::Error {
+    couch_store::error::Error::Corrupt(msg.into())
+}
+
+/// Adapts couch-store's chunk-aware attachment reader to the extractor's
+/// reader contract (skips over known-length chunks never touch the disk).
+struct ChunkSkipRead<'a>(couch_store::doc::AttReader<'a>);
+
+impl couch_proto::SkipRead for ChunkSkipRead<'_> {
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), String> {
+        self.0.read_exact(buf).map_err(|e| e.to_string())
+    }
+
+    fn skip(&mut self, n: u64) -> Result<(), String> {
+        self.0.skip(n).map_err(|e| e.to_string())
     }
 }

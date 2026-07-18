@@ -1760,3 +1760,168 @@ async fn proto_schema_mango() {
     assert_eq!(s, 200);
     assert_eq!(ids(&v), vec!["lg1"]);
 }
+
+fn pb_bytes_long(field: u32, data: &[u8]) -> Vec<u8> {
+    let mut b = Vec::new();
+    let mut v = ((field as u64) << 3) | 2;
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 { b.push(byte); break; }
+        b.push(byte | 0x80);
+    }
+    let mut l = data.len() as u64;
+    loop {
+        let byte = (l & 0x7f) as u8;
+        l >>= 7;
+        if l == 0 { b.push(byte); break; }
+        b.push(byte | 0x80);
+    }
+    b.extend_from_slice(data);
+    b
+}
+
+/// Index maintenance extracts only the indexed paths from blob wire bytes:
+/// a blob dominated by a huge field the index doesn't touch must still key
+/// correctly (the big field is skipped, not decoded), and the same doc must
+/// answer full-view selector queries too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proto_selective_extraction() {
+    let srv = start(None, false).await;
+    let c = client();
+    let b = &srv.base;
+
+    jput(&c, &format!("{b}/xdb"), &json!({})).await;
+    assert_eq!(jput(&c, &format!("{b}/_schemas"), &json!({})).await.0, 201);
+    let (_, v) = jput(&c, &format!("{b}/_schemas/x"), &json!({})).await;
+    let rev = v["rev"].as_str().unwrap();
+    let r = c
+        .put(format!("{b}/_schemas/x/descriptor.pb?rev={rev}"))
+        .header("content-type", "application/octet-stream")
+        .body(proto_descriptor_set())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 201);
+
+    // Index first, docs after: every doc is keyed by the incremental
+    // updater, whose augmenter runs in extraction mode (fields, no pfs).
+    let (s, _) = jpost(
+        &c,
+        &format!("{b}/xdb/_index"),
+        &json!({"index": {"fields": ["area"]}, "name": "idx_area"}),
+    )
+    .await;
+    assert_eq!(s, 200);
+
+    // 6 MiB of unknown-field payload dwarfing the wanted 9-byte area field
+    // (multi-chunk in couch-store, so skipping also skips disk chunks).
+    let mut blob = boundary_blob("giant", 424242.0, 3.0, 4.0, 9);
+    blob.extend_from_slice(&pb_bytes_long(900, &vec![0x5Au8; 6 * 1024 * 1024]));
+    put_blob_doc(&c, b, "xdb", "big1", "field_boundary", &blob).await;
+    put_blob_doc(&c, b, "xdb", "small1", "field_boundary", &boundary_blob("s", 7.0, 1.0, 2.0, 1)).await;
+
+    let (s, v) = jpost(
+        &c,
+        &format!("{b}/xdb/_find"),
+        &json!({"selector": {"area": {"$gte": 400000}}, "limit": 10}),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let ids: Vec<&str> = v["docs"].as_array().unwrap().iter().map(|d| d["_id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["big1"]);
+
+    // Full-view path (selector on a non-indexed blob field) still works on
+    // the same doc — extraction and full decode agree.
+    let (s, v) = jpost(
+        &c,
+        &format!("{b}/xdb/_find"),
+        &json!({"selector": {"name": "giant"}, "fields": ["_id", "area", "topLeft.latitude"], "limit": 10}),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let d = &v["docs"].as_array().unwrap()[0];
+    assert_eq!(d["_id"], json!("big1"));
+    assert_eq!(d["area"], json!(424242.0));
+    assert_eq!(d["topLeft"]["latitude"], json!(3.0));
+}
+
+/// No fallbacks: problems surface where they happen instead of degrading.
+/// Bad descriptor uploads are rejected at the door; a corrupt blob of a
+/// REGISTERED doctype fails the queries that touch it (and heals when the
+/// bad doc is removed); unregistered doctypes stay opaque by contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proto_strictness() {
+    let srv = start(None, false).await;
+    let c = client();
+    let b = &srv.base;
+
+    jput(&c, &format!("{b}/sdb"), &json!({})).await;
+    assert_eq!(jput(&c, &format!("{b}/_schemas"), &json!({})).await.0, 201);
+
+    // Interactive _schemas writes are validated at the door.
+    let (s, v) = jput(&c, &format!("{b}/_schemas/bad1"), &json!({"doctypes": "nope"})).await;
+    assert_eq!(s, 400, "{v}");
+    let (s, v) = jput(
+        &c,
+        &format!("{b}/_schemas/bad2"),
+        &json!({"doctypes": {"x": 42}}),
+    )
+    .await;
+    assert_eq!(s, 400, "{v}");
+    let (_, v) = jput(&c, &format!("{b}/_schemas/x"), &json!({})).await;
+    let rev = v["rev"].as_str().unwrap();
+    let r = c
+        .put(format!("{b}/_schemas/x/garbage.pb?rev={rev}"))
+        .header("content-type", "application/octet-stream")
+        .body(vec![0xffu8, 0x13, 0x37])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 400);
+
+    // Register the real descriptor set.
+    let (_, v) = jget(&c, &format!("{b}/_schemas/x")).await;
+    let rev = v["_rev"].as_str().unwrap();
+    let r = c
+        .put(format!("{b}/_schemas/x/descriptor.pb?rev={rev}"))
+        .header("content-type", "application/octet-stream")
+        .body(proto_descriptor_set())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 201);
+
+    put_blob_doc(&c, b, "sdb", "ok1", "field_boundary", &boundary_blob("fine", 10.0, 1.0, 2.0, 1)).await;
+    let q = json!({"selector": {"area": {"$gte": 1}}, "limit": 10});
+    let (s, v) = jpost(&c, &format!("{b}/sdb/_find"), &q).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["docs"].as_array().unwrap().len(), 1);
+
+    // A corrupt blob of a REGISTERED doctype fails queries that touch it —
+    // loudly, instead of being silently treated as opaque.
+    // (0x1a = field 3 length-delimited, length 0xff, then nothing.)
+    put_blob_doc(&c, b, "sdb", "corrupt1", "field_boundary", &[0x1a, 0xff, 0x01]).await;
+    let (s, v) = jpost(&c, &format!("{b}/sdb/_find"), &q).await;
+    assert_eq!(s, 500, "corrupt registered blob must fail the query, got: {v}");
+
+    // Removing the bad doc heals the database.
+    let (_, v) = jget(&c, &format!("{b}/sdb/corrupt1")).await;
+    let rev = v["_rev"].as_str().unwrap();
+    let r = c
+        .delete(format!("{b}/sdb/corrupt1?rev={rev}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    let (s, v) = jpost(&c, &format!("{b}/sdb/_find"), &q).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["docs"].as_array().unwrap().len(), 1);
+
+    // Unregistered doctypes are opaque by contract, not by failure: the
+    // same corrupt bytes under an unknown doctype don't error anything.
+    put_blob_doc(&c, b, "sdb", "unk1", "not_registered", &[0x1a, 0xff, 0x01]).await;
+    let (s, v) = jpost(&c, &format!("{b}/sdb/_find"), &q).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["docs"].as_array().unwrap().len(), 1);
+}

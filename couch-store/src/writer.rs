@@ -1208,6 +1208,71 @@ mod tests {
     /// Spooled attachments: multi-chunk write from a temp file, byte-exact
     /// read-back, and survival through compaction (which re-chunks).
     #[test]
+    fn att_reader_skips_chunks_without_reading() {
+        use std::io::{Seek, SeekFrom, Write};
+        let path = tmppath("attreader.couch");
+        let data: Vec<u8> = (0..(2 * ATT_CHUNK_SIZE + ATT_CHUNK_SIZE / 2))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut spool = tempfile::tempfile().unwrap();
+        spool.write_all(&data).unwrap();
+        spool.seek(SeekFrom::Start(0)).unwrap();
+        {
+            let mut w = DbWriter::create(&path).unwrap();
+            let outcome = w
+                .save_doc_with_spools(
+                    &json!({"_id": "big",
+                            "_attachments": {"blob.bin": {"content_type": "application/protobuf"}}}),
+                    None,
+                    vec![SpooledAtt {
+                        name: "blob.bin".into(),
+                        content_type: "application/protobuf".into(),
+                        revpos: None,
+                        file: spool,
+                        len: data.len() as u64,
+                        md5: Md5::digest(&data).to_vec(),
+                    }],
+                )
+                .unwrap();
+            assert!(matches!(outcome, SaveOutcome::Ok { .. }));
+            w.commit().unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let att = db.att_info(b"big", "blob.bin").unwrap().unwrap();
+        assert!(att.chunks.len() >= 3);
+        assert!(db.att_info(b"big", "nope").unwrap().is_none());
+
+        // Skip straight into the third chunk: the first two are never read.
+        let mut r = crate::doc::AttReader::new(&db.file, &att);
+        let skip_to = 2 * ATT_CHUNK_SIZE + 100;
+        r.skip(skip_to as u64).unwrap();
+        let mut buf = [0u8; 16];
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf[..], &data[skip_to..skip_to + 16]);
+        assert_eq!(r.chunks_read, 1, "only the chunk containing the read");
+        assert!(r.skip(att.att_len).is_err(), "skip past end must error");
+
+        // Interleaved read/skip/read stays consistent with the raw bytes.
+        let mut r = crate::doc::AttReader::new(&db.file, &att);
+        let mut head = [0u8; 32];
+        r.read_exact(&mut head).unwrap();
+        assert_eq!(&head[..], &data[..32]);
+        r.skip((ATT_CHUNK_SIZE + 7) as u64).unwrap();
+        let mut mid = [0u8; 8];
+        r.read_exact(&mut mid).unwrap();
+        let at = 32 + ATT_CHUNK_SIZE + 7;
+        assert_eq!(&mid[..], &data[at..at + 8]);
+
+        // Full sequential read touches every chunk and matches.
+        let mut r = crate::doc::AttReader::new(&db.file, &att);
+        let mut all = vec![0u8; att.att_len as usize];
+        r.read_exact(&mut all).unwrap();
+        assert_eq!(all, data);
+        assert_eq!(r.chunks_read, att.chunks.len());
+    }
+
+    #[test]
     fn spooled_attachment_roundtrip_and_compact() {
         use std::io::{Seek, SeekFrom, Write};
         let path = tmppath("spool.couch");

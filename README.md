@@ -49,9 +49,17 @@ OpenSSL; runs on ARM Linux).
   same paths the app uses for its JSON docs. Message types resolve from
   `db.DocType` by convention (snake_case of the message name) or an
   explicit `doctypes` mapping in the schema doc. Docs returned without a
-  projection stay byte-identical stored JSON; unregistered types and
-  oversized blobs stay opaque; the attachment bytes are never rewritten,
-  so replication (to stock CouchDB included) is unaffected. Create
+  projection stay byte-identical stored JSON; the attachment bytes are
+  never rewritten, so replication (to stock CouchDB included) is
+  unaffected. Index maintenance doesn't decode whole messages: the
+  indexed paths are extracted straight from the wire bytes, skipping
+  every unwanted field by its length prefix — with chunked attachment
+  storage, skipped 1 MiB chunks are never read from disk (52 MB message,
+  one indexed field: 25 ms vs 1.7 s full decode, in memory). No
+  fallbacks: unregistered doctypes are opaque *by contract*, but a
+  corrupt or over-limit blob of a registered type fails the query that
+  touched it, and malformed descriptor uploads are rejected at write
+  time — problems surface instead of degrading silently. Create
   blob-field indexes after registering schemas — already-indexed docs
   aren't re-keyed retroactively.
 - HTTP gzip, negotiated per request (stock CouchDB compresses neither

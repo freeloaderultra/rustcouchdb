@@ -203,20 +203,25 @@ impl ServerState {
     }
 
     /// The proto schema registry built from the `_schemas` database, rebuilt
-    /// whenever that database's update_seq moves. None without a usable
-    /// `_schemas`. Does file IO on rebuild — call from a blocking context.
-    pub fn proto_registry(&self) -> Option<Arc<couch_proto::Registry>> {
-        let sdb = self.dbs.read().unwrap().get(crate::proto::SCHEMAS_DB).cloned()?;
+    /// whenever that database's update_seq moves. Ok(None) without a usable
+    /// `_schemas`; a structurally broken `_schemas` is an error for the
+    /// caller to surface (failures are never cached — a fixed `_schemas`
+    /// heals on the next call). Does file IO on rebuild — call from a
+    /// blocking context.
+    pub fn proto_registry(&self) -> ApiResult<Option<Arc<couch_proto::Registry>>> {
+        let Some(sdb) = self.dbs.read().unwrap().get(crate::proto::SCHEMAS_DB).cloned() else {
+            return Ok(None);
+        };
         let snap = sdb.snapshot();
         let seq = snap.header.update_seq;
         if let Some((cached_seq, reg)) = &*self.proto_cache.read().unwrap() {
             if *cached_seq == seq {
-                return reg.clone();
+                return Ok(reg.clone());
             }
         }
-        let reg = crate::proto::build_registry(&snap);
+        let reg = crate::proto::build_registry(&snap)?;
         *self.proto_cache.write().unwrap() = Some((seq, reg.clone()));
-        reg
+        Ok(reg)
     }
 
     /// Where a NEW database with this name would be created. Databases that
