@@ -30,6 +30,7 @@ pub fn is_proto_content_type(ct: &str) -> bool {
 /// A set of registered message descriptors, addressable by the `db.DocType`
 /// convention (snake_case of the message short name) or an explicit mapping.
 pub struct Registry {
+    pool: DescriptorPool,
     by_doctype: HashMap<String, MessageDescriptor>,
 }
 
@@ -103,7 +104,79 @@ impl Registry {
                 )),
             }
         }
-        Ok((Registry { by_doctype }, problems))
+        Ok((Registry { pool, by_doctype }, problems))
+    }
+
+    /// Look up a message by its fully-qualified name (proto-native document
+    /// bodies carry the full name, not the DocType convention).
+    pub fn resolve_full(&self, full_name: &str) -> Option<MessageDescriptor> {
+        self.pool.get_message_by_name(full_name)
+    }
+
+    /// Encode a protojson-shaped JSON value as message bytes for `full_name`,
+    /// mirroring the way the nxguide backend reads its own JSON documents:
+    /// `protojson.UnmarshalOptions{DiscardUnknown: true}`. Unknown top-level
+    /// keys (legacy field names left by proto renames — the backend drops
+    /// these on every read, and `reserved` fields make them permanently
+    /// dead) are ignored, but every one is returned so the migration can
+    /// report exactly what it dropped: matching the app is correct, silence
+    /// is not.
+    ///
+    /// A missing schema is still a hard error — a document whose type can't
+    /// be resolved cannot be migrated, and that must stop the run.
+    pub fn encode_message_lenient(
+        &self,
+        full_name: &str,
+        view: &Value,
+    ) -> Result<(Vec<u8>, Vec<String>), String> {
+        use prost_reflect::DeserializeOptions;
+        let desc = self
+            .resolve_full(full_name)
+            .ok_or_else(|| format!("no schema registered for message {full_name:?}"))?;
+        // Top-level keys the descriptor doesn't know (by json name or proto
+        // name) — exactly what DiscardUnknown will drop.
+        let mut dropped = Vec::new();
+        if let Some(obj) = view.as_object() {
+            for k in obj.keys() {
+                let known = desc
+                    .fields()
+                    .any(|f| f.json_name() == k || f.name() == k);
+                if !known {
+                    dropped.push(k.clone());
+                }
+            }
+        }
+        let json = serde_json::to_string(view).map_err(|e| e.to_string())?;
+        let mut de = serde_json::Deserializer::from_str(&json);
+        let msg = DynamicMessage::deserialize_with_options(
+            desc,
+            &mut de,
+            &DeserializeOptions::new().deny_unknown_fields(false),
+        )
+        .map_err(|e| format!("cannot encode {full_name} from JSON: {e}"))?;
+        de.end().map_err(|e| e.to_string())?;
+        Ok((msg.encode_to_vec(), dropped))
+    }
+
+    /// Verify bytes decode against the current schema without building the
+    /// (potentially large) JSON view — a cheap validity check for migration.
+    pub fn can_decode(&self, full_name: &str, bytes: &[u8]) -> Result<(), String> {
+        let desc = self
+            .resolve_full(full_name)
+            .ok_or_else(|| format!("no schema registered for message {full_name:?}"))?;
+        DynamicMessage::decode(desc.clone(), bytes)
+            .map(|_| ())
+            .map_err(|e| format!("cannot decode {full_name}: {e}"))
+    }
+
+    /// Decode message bytes addressed by fully-qualified message name.
+    pub fn decode_message(&self, full_name: &str, bytes: &[u8]) -> Result<Value, String> {
+        let desc = self
+            .resolve_full(full_name)
+            .ok_or_else(|| format!("no schema registered for message {full_name:?}"))?;
+        let msg = DynamicMessage::decode(desc.clone(), bytes)
+            .map_err(|e| format!("cannot decode {full_name}: {e}"))?;
+        serde_json::to_value(&msg).map_err(|e| format!("cannot JSON-encode {full_name}: {e}"))
     }
 
     pub fn is_empty(&self) -> bool {

@@ -5,6 +5,14 @@ edition = "2021"
 description = "rustcouchdb server: the CouchDB HTTP API on couch-store + couch-index, with couch-repl embedded"
 license = "Apache-2.0"
 
+[[bin]]
+name = "couch-http"
+path = "src/main.rs"
+
+[[bin]]
+name = "migrate-proto"
+path = "src/bin/migrate_proto.rs"
+
 [dependencies]
 couch-store = { path = "../couch-store" }
 couch-index = { path = "../couch-index" }

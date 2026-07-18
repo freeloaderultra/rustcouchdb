@@ -47,6 +47,11 @@ pub async fn doc_get(
         .and_then(|v| v.to_str().ok())
         .map(|a| a.contains("multipart/mixed"))
         .unwrap_or(false);
+    let accept_proto = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|a| a.contains("application/protobuf") || a.contains("application/x-protobuf"))
+        .unwrap_or(false);
     let dbh = state.db(&db)?;
     let docid2 = docid.clone();
     blocking(move || {
@@ -123,6 +128,31 @@ pub async fn doc_get(
             return Err(ApiError::deleted());
         }
         let rev_str = doc["_rev"].as_str().unwrap_or("").to_string();
+        // Proto-native docs: raw bytes when the client asks for protobuf,
+        // the rendered domain view otherwise. The stored envelope itself is
+        // a replication transport, never a plain GET answer.
+        if crate::proto::is_envelope(&doc) {
+            if accept_proto {
+                let (type_name, bytes) = crate::proto::envelope_parts(&doc)?;
+                let mut resp = (StatusCode::OK, bytes).into_response();
+                resp.headers_mut().insert(
+                    header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("application/protobuf"),
+                );
+                resp.headers_mut().insert(
+                    "x-proto-type",
+                    axum::http::HeaderValue::from_str(&type_name)
+                        .map_err(|_| ApiError::bad_request("bad type name"))?,
+                );
+                resp.headers_mut().insert(header::ETAG, etag(&rev_str));
+                return Ok(resp);
+            }
+            let reg = state.proto_registry()?;
+            let view = crate::proto::render_view(reg.as_deref(), &doc)?;
+            let mut resp = Json(view).into_response();
+            resp.headers_mut().insert(header::ETAG, etag(&rev_str));
+            return Ok(resp);
+        }
         let mut resp = Json(doc).into_response();
         resp.headers_mut().insert(header::ETAG, etag(&rev_str));
         Ok(resp)
@@ -300,6 +330,36 @@ fn write_doc_with_spools(
     }
 
     let new_edits = qbool(q, "new_edits", true);
+
+    // Proto-native enforcement: application docs in a proto db are proto,
+    // period. JSON app writes (interactive or replicated from an old-world
+    // peer) are rejected; proto envelopes only arrive via replication.
+    let is_env = crate::proto::is_envelope(&doc);
+    if crate::proto::is_app_doc_id(&id) {
+        let proto_db = blocking(|| dbh.snapshot().proto_native());
+        if proto_db && !is_env {
+            return Err(ApiError::bad_request(
+                "proto-native database: application documents must be protobuf \
+                 (PUT with Content-Type: application/protobuf)",
+            ));
+        }
+        if !proto_db && is_env {
+            return Err(ApiError::bad_request(
+                "proto documents require a proto-native database",
+            ));
+        }
+        if is_env && new_edits {
+            return Err(ApiError::bad_request(
+                "$pb envelopes are a replication transport; interactive writes \
+                 use Content-Type: application/protobuf",
+            ));
+        }
+    } else if is_env {
+        return Err(ApiError::bad_request(
+            "reserved document ids cannot hold proto documents",
+        ));
+    }
+
     if new_edits {
         let validator = state.validator_for(db);
         let deleted = doc.get("_deleted") == Some(&Value::Bool(true));
@@ -317,7 +377,12 @@ fn write_doc_with_spools(
             SaveOutcome::Error { error, reason } => Err(ApiError::from_save(&error, &reason)),
         }
     } else {
-        let upd = DocUpdate::from_json_with_spools(doc, spools)?;
+        let upd = if is_env {
+            let (type_name, bytes) = crate::proto::envelope_parts(&doc)?;
+            DocUpdate::from_proto_envelope(&doc, type_name, bytes)?
+        } else {
+            DocUpdate::from_json_with_spools(doc, spools)?
+        };
         let rev = docmod::rev_str(upd.rev_path.0, &upd.rev_path.1[0]);
         blocking(|| dbh.with_writer(|w| w.update_docs(vec![upd])))?;
         if db == "_replicator" {
@@ -349,6 +414,9 @@ pub async fn doc_put(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    if couch_proto::is_proto_content_type(&ct) {
+        return proto_doc_put(state, db, docid, q, headers, request).await;
+    }
     let (mut doc, spools) = if ct.starts_with("multipart/related") {
         // Streamed: attachment parts spool to disk, only the JSON part
         // (and a boundary-sized carry) ever lives in memory.
@@ -369,6 +437,90 @@ pub async fn doc_put(
         crate::proto::validate_schemas_doc(&doc)?;
     }
     write_doc_with_spools(&state, &db, doc, spools, &q, &headers)
+}
+
+/// Cap on proto document bodies: they are decoded in memory at write time
+/// (validation) and at render time.
+const PB_DOC_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Interactive PUT of a proto-native document: `Content-Type:
+/// application/protobuf` + `X-Proto-Type: <full.message.Name>`. The bytes
+/// are stored verbatim; they must decode against the registered schemas
+/// (that decoded view is also what the validation hook sees). Only valid
+/// in proto-native databases.
+async fn proto_doc_put(
+    state: App,
+    db: String,
+    docid: String,
+    q: Q,
+    headers: HeaderMap,
+    request: Request,
+) -> ApiResult<Response> {
+    let type_name = headers
+        .get("x-proto-type")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .ok_or_else(|| {
+            ApiError::bad_request("proto document PUT requires the X-Proto-Type header")
+        })?;
+    let rev = q.get("rev").cloned().or_else(|| {
+        headers
+            .get(header::IF_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim_matches('"').to_string())
+    });
+    let bytes = axum::body::to_bytes(request.into_body(), PB_DOC_LIMIT)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("body read failed: {e}")))?;
+    let dbh = state.db(&db)?;
+    blocking(move || {
+        if !crate::proto::is_app_doc_id(&docid) {
+            return Err(ApiError::bad_request(
+                "reserved document ids cannot hold proto documents",
+            ));
+        }
+        if !dbh.snapshot().proto_native() {
+            return Err(ApiError::bad_request(
+                "proto documents require a proto-native database (create with ?proto=true)",
+            ));
+        }
+        let reg = state.proto_registry()?.ok_or_else(|| {
+            ApiError::bad_request("no schemas registered in _schemas; cannot accept proto documents")
+        })?;
+        // Decode at the door: undecodable bytes never reach disk, and the
+        // decoded view is what validation sees.
+        let decoded = reg
+            .decode_message(&type_name, &bytes)
+            .map_err(ApiError::bad_request)?;
+        let mut view = decoded;
+        if let Some(obj) = view.as_object_mut() {
+            obj.insert("_id".into(), Value::String(docid.clone()));
+            if let Some(r) = &rev {
+                obj.insert("_rev".into(), Value::String(r.clone()));
+            }
+        } else {
+            return Err(ApiError::bad_request(format!(
+                "{type_name} does not decode to an object"
+            )));
+        }
+        let inner = state.validator_for(&db);
+        let wrapped = inner.map(|v| crate::proto::wrap_validator(Some(reg.clone()), v));
+        let outcome = dbh.with_writer(|w| {
+            w.save_proto_doc(
+                &docid,
+                rev.as_deref(),
+                false,
+                &type_name,
+                bytes.to_vec(),
+                &view,
+                wrapped.as_ref().map(|w| w as _),
+            )
+        })?;
+        match outcome {
+            SaveOutcome::Ok { rev } => Ok(created(&docid, &rev)),
+            SaveOutcome::Error { error, reason } => Err(ApiError::from_save(&error, &reason)),
+        }
+    })
 }
 
 /// Zip multipart body parts with the doc's `follows` attachments in JSON
@@ -445,8 +597,50 @@ pub async fn doc_delete(
                 .map(|s| s.trim_matches('"').to_string())
         })
         .ok_or_else(ApiError::conflict)?;
-    let doc = json!({"_id": docid, "_rev": rev, "_deleted": true});
     let dbh = state.db(&db)?;
+
+    // Proto-native deletion: the tombstone is a proto document too — the
+    // winner's message type with an empty body (every type decodes empty).
+    if crate::proto::is_app_doc_id(&docid) && blocking(|| dbh.snapshot().proto_native()) {
+        let docid2 = docid.clone();
+        let rev2 = rev.clone();
+        return blocking(move || {
+            let snap = dbh.snapshot();
+            let cur = snap
+                .open_doc(docid2.as_bytes(), None, &Default::default())?
+                .ok_or_else(ApiError::missing)?;
+            let (type_name, _) = crate::proto::envelope_parts(&cur)?;
+            let reg = state.proto_registry()?;
+            let view = json!({"_id": docid2, "_rev": rev2, "_deleted": true});
+            let inner = state.validator_for(&db);
+            let wrapped = inner.map(|v| crate::proto::wrap_validator(reg, v));
+            let outcome = dbh.with_writer(|w| {
+                w.save_proto_doc(
+                    &docid2,
+                    Some(&rev2),
+                    true,
+                    &type_name,
+                    Vec::new(),
+                    &view,
+                    wrapped.as_ref().map(|w| w as _),
+                )
+            })?;
+            match outcome {
+                SaveOutcome::Ok { rev } => {
+                    let mut resp = (
+                        StatusCode::OK,
+                        Json(json!({"ok": true, "id": docid2, "rev": rev})),
+                    )
+                        .into_response();
+                    resp.headers_mut().insert(header::ETAG, etag(&rev));
+                    Ok(resp)
+                }
+                SaveOutcome::Error { error, reason } => Err(ApiError::from_save(&error, &reason)),
+            }
+        });
+    }
+
+    let doc = json!({"_id": docid, "_rev": rev, "_deleted": true});
     let validator = state.validator_for(&db);
     let outcome = blocking(|| dbh.with_writer(|w| w.save_doc(&doc, validator)))?;
     match outcome {

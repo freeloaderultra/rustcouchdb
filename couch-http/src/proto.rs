@@ -182,6 +182,34 @@ pub fn augmenter(
     reg: Arc<Registry>,
 ) -> impl Fn(&Db, &Value, Option<&[String]>) -> couch_store::error::Result<Option<Value>> {
     move |db, doc, wanted| {
+        // Proto-native body: the envelope carries the bytes; the view is
+        // decoded (or path-extracted) directly from them. Unlike legacy
+        // blob attachments, an unrenderable proto body is an error — in a
+        // proto-native db every application doc must decode.
+        if is_envelope(doc) {
+            let (type_name, bytes) = envelope_parts(doc)?;
+            let id = doc.get("_id").and_then(|v| v.as_str()).unwrap_or("?");
+            let desc = reg.resolve_full(&type_name).ok_or_else(|| {
+                couch_store::error::Error::Unsupported(format!(
+                    "{id}: no schema registered for message {type_name:?}"
+                ))
+            })?;
+            if let Some(paths) = wanted {
+                if let Some(trie) = couch_proto::PathTrie::compile(&desc, paths) {
+                    let partial = trie
+                        .extract(&mut couch_proto::SliceReader(&bytes), bytes.len() as u64)
+                        .map_err(|e| {
+                            corrupt(format!("{id}: extracting {paths:?} from {type_name}: {e}"))
+                        })?;
+                    return Ok(Some(meta_over(partial, doc)));
+                }
+            }
+            let decoded = reg
+                .decode_message(&type_name, &bytes)
+                .map_err(|e| corrupt(format!("{id}: {e}")))?;
+            return Ok(Some(meta_over(decoded, doc)));
+        }
+
         let Some((att_name, doctype, _len)) = couch_proto::blob_candidate(doc) else {
             return Ok(None);
         };
@@ -234,6 +262,112 @@ pub fn augmenter(
 
 fn corrupt(msg: impl Into<String>) -> couch_store::error::Error {
     couch_store::error::Error::Corrupt(msg.into())
+}
+
+// ---- proto-native document bodies ------------------------------------
+
+/// Envelope keys couch-store emits for proto bodies (`doc::body_json`).
+pub const PB_TYPE: &str = "$pb_type";
+pub const PB_BODY: &str = "$pb_body";
+
+pub fn is_envelope(doc: &Value) -> bool {
+    doc.get(PB_TYPE).is_some()
+}
+
+/// Application docs are proto in a proto-native db; design/local docs are
+/// server bookkeeping and stay JSON.
+pub fn is_app_doc_id(id: &str) -> bool {
+    !id.starts_with("_design/") && !id.starts_with("_local/")
+}
+
+pub fn envelope_parts(doc: &Value) -> Result<(String, Vec<u8>), couch_store::error::Error> {
+    use base64::Engine as _;
+    let id = doc.get("_id").and_then(|v| v.as_str()).unwrap_or("?");
+    let t = doc
+        .get(PB_TYPE)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| corrupt(format!("{id}: $pb_type is not a string")))?;
+    let b64 = doc
+        .get(PB_BODY)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| corrupt(format!("{id}: proto envelope without $pb_body")))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| corrupt(format!("{id}: bad $pb_body base64: {e}")))?;
+    Ok((t.to_string(), bytes))
+}
+
+/// Render a proto envelope as its domain view: the decoded message with the
+/// doc's `_*` metadata carried over and `$pb_*` stripped. A proto document
+/// that cannot be rendered (no registry, unknown type, undecodable bytes)
+/// is an error — in a proto-native world that is corruption, not a doc that
+/// quietly loses its fields.
+pub fn render_view(
+    reg: Option<&Registry>,
+    doc: &Value,
+) -> Result<Value, couch_store::error::Error> {
+    let (type_name, bytes) = envelope_parts(doc)?;
+    let id = doc.get("_id").and_then(|v| v.as_str()).unwrap_or("?");
+    let reg = reg.ok_or_else(|| {
+        couch_store::error::Error::Unsupported(format!(
+            "{id}: proto document but no schemas are registered in _schemas"
+        ))
+    })?;
+    let decoded = reg
+        .decode_message(&type_name, &bytes)
+        .map_err(|e| corrupt(format!("{id}: {e}")))?;
+    if !decoded.is_object() {
+        return Err(corrupt(format!("{id}: decoded {type_name} is not an object")));
+    }
+    Ok(meta_over(decoded, doc))
+}
+
+/// Render when the doc is a proto envelope; pass JSON docs through.
+pub fn render_if_envelope(
+    reg: Option<&Registry>,
+    doc: Value,
+) -> Result<Value, couch_store::error::Error> {
+    if is_envelope(&doc) {
+        render_view(reg, &doc)
+    } else {
+        Ok(doc)
+    }
+}
+
+/// Decoded (or extracted) message fields plus the doc's `_*` metadata —
+/// `$pb_*` deliberately not carried over.
+fn meta_over(decoded: Value, doc: &Value) -> Value {
+    let Value::Object(mut view) = decoded else {
+        return decoded;
+    };
+    if let Some(obj) = doc.as_object() {
+        for (k, v) in obj {
+            if k.starts_with('_') {
+                view.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    Value::Object(view)
+}
+
+/// Wrap the db's validator so it sees decoded views instead of envelopes:
+/// old proto parents are rendered before the inner hook runs. Rendering
+/// failures reject the write with the real reason.
+pub fn wrap_validator<'a>(
+    reg: Option<Arc<Registry>>,
+    inner: couch_store::writer::Validator<'a>,
+) -> impl Fn(&Value, Option<&Value>) -> Result<(), String> + 'a {
+    move |new: &Value, old: Option<&Value>| {
+        let decoded_old;
+        let old = match old {
+            Some(o) if is_envelope(o) => {
+                decoded_old = render_view(reg.as_deref(), o).map_err(|e| e.to_string())?;
+                Some(&decoded_old)
+            }
+            other => other,
+        };
+        inner(new, old)
+    }
 }
 
 /// Adapts couch-store's chunk-aware attachment reader to the extractor's

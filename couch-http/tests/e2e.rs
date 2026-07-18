@@ -1925,3 +1925,112 @@ async fn proto_strictness() {
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["docs"].as_array().unwrap().len(), 1);
 }
+
+/// Proto-native world: application documents ARE protobuf bytes; no JSON is
+/// stored. PUT/GET/_find/_delete/replication all work over proto bodies,
+/// and JSON application writes are rejected (no fallbacks, no coexistence).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn proto_native_documents() {
+    let src = start(None, false).await;
+    let c = client();
+    let b = &src.base;
+
+    let (_, welcome) = jget(&c, b).await;
+    assert!(welcome["features"].as_array().unwrap().iter().any(|f| f == "proto-docs"));
+
+    // Register schemas, create a proto-native db.
+    assert_eq!(jput(&c, &format!("{b}/_schemas"), &json!({})).await.0, 201);
+    let (_, v) = jput(&c, &format!("{b}/_schemas/s"), &json!({})).await;
+    let rev = v["rev"].as_str().unwrap();
+    let r = c.put(format!("{b}/_schemas/s/d.pb?rev={rev}"))
+        .header("content-type", "application/octet-stream")
+        .body(proto_descriptor_set()).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 201);
+    assert_eq!(c.put(format!("{b}/pn?proto=true")).send().await.unwrap().status().as_u16(), 201);
+
+    // JSON application write into a proto db is rejected — no fallback.
+    let (s, _) = jput(&c, &format!("{b}/pn/j1"), &json!({"area": 1.0})).await;
+    assert_eq!(s, 400);
+
+    // PUT a proto document (FieldBoundary bytes).
+    let put_pb = |id: &str, blob: Vec<u8>| {
+        let url = format!("{b}/pn/{id}");
+        let c = c.clone();
+        async move {
+            c.put(url).header("content-type", "application/protobuf")
+                .header("x-proto-type", "test.v1.FieldBoundary")
+                .body(blob).send().await.unwrap()
+        }
+    };
+    let r = put_pb("f1", boundary_blob("north", 42.0, 48.0, 11.0, 100)).await;
+    assert_eq!(r.status().as_u16(), 201);
+    let rev1 = r.json::<Value>().await.unwrap()["rev"].as_str().unwrap().to_string();
+
+    // Bytes that don't decode as the declared type are rejected at the door.
+    let r = put_pb("bad", vec![0x1a, 0xff, 0x01]).await;
+    assert_eq!(r.status().as_u16(), 400);
+
+    // GET as protobuf → exact bytes back; GET as JSON → rendered view.
+    let r = c.get(format!("{b}/pn/f1")).header("accept", "application/protobuf").send().await.unwrap();
+    assert_eq!(r.headers().get("x-proto-type").unwrap(), "test.v1.FieldBoundary");
+    let got = r.bytes().await.unwrap();
+    assert_eq!(got.as_ref(), boundary_blob("north", 42.0, 48.0, 11.0, 100).as_slice());
+    let (s, v) = jget(&c, &format!("{b}/pn/f1")).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["name"], json!("north"));
+    assert_eq!(v["area"], json!(42.0));
+    assert_eq!(v["topLeft"]["latitude"], json!(48.0));
+    assert!(v.get("$pb_body").is_none(), "view must not leak the envelope: {v}");
+
+    // _find over proto bodies (bare + projected + index).
+    for (id, a) in [("f2", 150.0), ("f3", 250.0)] {
+        assert_eq!(put_pb(id, boundary_blob(id, a, 1.0, 2.0, 9)).await.status().as_u16(), 201);
+    }
+    let (s, v) = jpost(&c, &format!("{b}/pn/_find"),
+        &json!({"selector": {"area": {"$gte": 100}}, "limit": 10})).await;
+    assert_eq!(s, 200);
+    let mut ids: Vec<&str> = v["docs"].as_array().unwrap().iter().map(|d| d["_id"].as_str().unwrap()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["f2", "f3"]);
+    // bare result is the rendered view, not the envelope
+    let f2 = v["docs"].as_array().unwrap().iter().find(|d| d["_id"] == "f2").unwrap();
+    assert_eq!(f2["area"], json!(150.0));
+    assert!(f2.get("$pb_type").is_none());
+
+    // _all_docs include_docs renders too.
+    let (_, v) = jget(&c, &format!("{b}/pn/_all_docs?include_docs=true")).await;
+    let doc = v["rows"].as_array().unwrap().iter().find(|r| r["id"] == "f1").unwrap();
+    assert_eq!(doc["doc"]["name"], json!("north"));
+
+    // Delete produces a proto tombstone; the doc is then missing.
+    let r = c.delete(format!("{b}/pn/f1?rev={rev1}")).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(jget(&c, &format!("{b}/pn/f1")).await.0, 404);
+
+    // Replicate the proto-native db to a second proto-native server: bodies
+    // flow through the embedded replicator as $pb envelopes and land intact.
+    let tgt = start(None, false).await;
+    let tb = &tgt.base;
+    assert_eq!(jput(&c, &format!("{tb}/_schemas"), &json!({})).await.0, 201);
+    let (_, v) = jput(&c, &format!("{tb}/_schemas/s"), &json!({})).await;
+    let rev = v["rev"].as_str().unwrap();
+    let r = c.put(format!("{tb}/_schemas/s/d.pb?rev={rev}"))
+        .header("content-type", "application/octet-stream")
+        .body(proto_descriptor_set()).send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 201);
+    assert_eq!(c.put(format!("{tb}/pn?proto=true")).send().await.unwrap().status().as_u16(), 201);
+
+    let (s, rv) = jpost(&c, &format!("{b}/_replicate"),
+        &json!({"source": format!("{b}/pn"), "target": format!("{tb}/pn")})).await;
+    assert_eq!(s, 200, "{rv}");
+    assert_eq!(rv["ok"], json!(true));
+
+    // Target has the live docs as proto, queryable, with identical bytes.
+    let (s, v) = jpost(&c, &format!("{tb}/pn/_find"),
+        &json!({"selector": {"area": {"$gte": 100}}, "limit": 10})).await;
+    assert_eq!(s, 200);
+    assert_eq!(v["docs"].as_array().unwrap().len(), 2);
+    let r = c.get(format!("{tb}/pn/f2")).header("accept", "application/protobuf").send().await.unwrap();
+    assert_eq!(r.status().as_u16(), 200);
+    assert_eq!(r.bytes().await.unwrap().as_ref(), boundary_blob("f2", 150.0, 1.0, 2.0, 9).as_slice());
+}

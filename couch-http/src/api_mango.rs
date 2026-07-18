@@ -233,7 +233,8 @@ pub async fn find(
 
     // Proto-blob awareness: with schemas registered, selectors, index keys
     // and projections can reach fields inside protobuf blob attachments.
-    let aug_fn = blocking(|| state.proto_registry())?.map(crate::proto::augmenter);
+    let registry = blocking(|| state.proto_registry())?;
+    let aug_fn = registry.clone().map(crate::proto::augmenter);
 
     // Serialize index-file writes: choosing, materializing and updating the
     // index happen under the per-db lock. The scan itself runs after the
@@ -276,7 +277,10 @@ pub async fn find(
             &selector,
             aug_fn.as_ref().map(|f| f as _),
             &mut |doc| {
-                docs.push(doc);
+                // Bare proto-native results come back as the stored $pb
+                // envelope; render them to the domain view (projected
+                // results already went through the augmenter's view).
+                docs.push(crate::proto::render_if_envelope(registry.as_deref(), doc)?);
                 Ok(())
             },
         )?;

@@ -31,6 +31,50 @@ pub struct AttInfo {
     pub encoding: String, // "identity" | "gzip"
 }
 
+/// A stored document body: either the classic EJSON term or a protobuf
+/// message (`{pb, TypeName, Bytes}` in the summary body slot — a
+/// rustcouchdb extension; stock CouchDB cannot interpret these files).
+pub enum DocBody<'a> {
+    Json(&'a Term),
+    Proto { type_name: String, bytes: &'a [u8] },
+}
+
+pub fn classify_body(t: &Term) -> Result<DocBody<'_>> {
+    if let Ok(tup) = t.as_tuple() {
+        if tup.len() == 3 && tup[0].is_atom("pb") {
+            return Ok(DocBody::Proto {
+                type_name: bin_str(&tup[1])?,
+                bytes: tup[2].as_bin()?,
+            });
+        }
+    }
+    Ok(DocBody::Json(t))
+}
+
+/// Render a stored body as JSON. EJSON bodies decode as before; proto
+/// bodies become the lossless envelope `{"$pb_type": ..., "$pb_body":
+/// <base64>}` — the single representation every layer above (rendering,
+/// validation, replication, Mango augmentation) works from.
+pub fn body_json(t: &Term) -> Result<Value> {
+    use base64::engine::general_purpose::STANDARD;
+    match classify_body(t)? {
+        DocBody::Json(term) => crate::ejson::to_json(term),
+        DocBody::Proto { type_name, bytes } => Ok(serde_json::json!({
+            "$pb_type": type_name,
+            "$pb_body": STANDARD.encode(bytes),
+        })),
+    }
+}
+
+/// Build the disk term for a proto body.
+pub fn proto_body_term(type_name: &str, bytes: Vec<u8>) -> Term {
+    Term::Tuple(vec![
+        Term::atom("pb"),
+        Term::Bin(type_name.as_bytes().to_vec()),
+        Term::Bin(bytes),
+    ])
+}
+
 pub fn read_summary(file: &CouchFile, ptr: u64) -> Result<Summary> {
     let bin = file.read_chunk(ptr)?;
     let outer = etf::decode(&bin)?;

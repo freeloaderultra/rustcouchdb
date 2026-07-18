@@ -87,6 +87,28 @@ impl Db {
         }))
     }
 
+    /// Whether this database is proto-native (application documents are
+    /// protobuf-bodied; JSON app writes are rejected upstream). Set by
+    /// migration or proto-mode creation via `DbWriter::mark_proto_native`.
+    pub fn proto_native(&self) -> bool {
+        let Term::Int(ptr) = &self.header.props_ptr else {
+            return false;
+        };
+        let Ok(t) = self.file.read_term(*ptr as u64) else {
+            return false;
+        };
+        let Ok(items) = t.as_list() else {
+            return false;
+        };
+        items.iter().any(|p| {
+            p.as_tuple().is_ok_and(|kv| {
+                kv.len() == 2
+                    && kv[0].as_bin().is_ok_and(|b| b == b"proto_native")
+                    && kv[1].is_atom("true")
+            })
+        })
+    }
+
     pub fn security(&self) -> Result<Value> {
         match &self.header.security_ptr {
             Term::Int(ptr) => {
@@ -204,7 +226,10 @@ impl Db {
             None => None,
         };
         if let Some(s) = &summary {
-            let body = ejson::to_json(&s.body)?;
+            // Proto bodies render as the lossless $pb envelope; the HTTP
+            // layer holds the schema registry and turns it into a domain
+            // view (or serves the raw bytes) as the request demands.
+            let body = doc::body_json(&s.body)?;
             match body {
                 Value::Object(o) => m.extend(o),
                 Value::Array(a) if a.is_empty() => {} // make_doc's body=[] for nil ptr

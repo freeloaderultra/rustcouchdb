@@ -33,6 +33,35 @@ pub async fn bulk_docs(
     let validator = state.validator_for(&db);
 
     let results = blocking(move || -> ApiResult<Vec<Value>> {
+        let proto_db = dbh.snapshot().proto_native();
+        // Proto-native enforcement, batch-wide and up front: the whole
+        // request fails if any doc violates the world's rules — a partial
+        // batch masking bad docs is exactly the kind of fallback we refuse.
+        for doc in &docs {
+            let id = doc.get("_id").and_then(|i| i.as_str()).unwrap_or("");
+            let is_env = crate::proto::is_envelope(doc);
+            if crate::proto::is_app_doc_id(id) && !id.is_empty() {
+                if proto_db && !is_env {
+                    return Err(ApiError::bad_request(format!(
+                        "{id}: proto-native database: application documents must be protobuf"
+                    )));
+                }
+                if !proto_db && is_env {
+                    return Err(ApiError::bad_request(format!(
+                        "{id}: proto documents require a proto-native database"
+                    )));
+                }
+                if is_env && new_edits {
+                    return Err(ApiError::bad_request(format!(
+                        "{id}: $pb envelopes are a replication transport (new_edits:false)"
+                    )));
+                }
+            } else if is_env {
+                return Err(ApiError::bad_request(format!(
+                    "{id}: reserved document ids cannot hold proto documents"
+                )));
+            }
+        }
         let mut results = Vec::with_capacity(docs.len());
         if new_edits {
             dbh.with_writer(|w| {
@@ -73,7 +102,14 @@ pub async fn bulk_docs(
                         w.update_local(id.as_bytes(), Some(&doc))?;
                         continue;
                     }
-                    match DocUpdate::from_json(doc) {
+                    let parsed = if crate::proto::is_envelope(&doc) {
+                        crate::proto::envelope_parts(&doc)
+                            .map_err(couch_store::error::Error::from)
+                            .and_then(|(t, bytes)| DocUpdate::from_proto_envelope(&doc, t, bytes))
+                    } else {
+                        DocUpdate::from_json(doc)
+                    };
+                    match parsed {
                         Ok(u) => updates.push(u),
                         Err(e) => results.push(json!({
                             "id": id, "error": "bad_request", "reason": e.to_string()
@@ -314,6 +350,11 @@ async fn all_docs_inner(
     body: Option<Value>,
 ) -> ApiResult<Response> {
     let dbh = state.db(&db)?;
+    let registry = if qbool(&q, "include_docs", false) {
+        blocking(|| state.proto_registry())?
+    } else {
+        None
+    };
     blocking(move || {
         let snap = dbh.snapshot();
         let include_docs = qbool(&q, "include_docs", false);
@@ -355,7 +396,10 @@ async fn all_docs_inner(
                                 Value::Null
                             } else {
                                 crate::metrics::bump(&crate::metrics::DATABASE_READS);
-                                snap.open_doc(id.as_bytes(), None, &opts)?.unwrap_or(Value::Null)
+                                match snap.open_doc(id.as_bytes(), None, &opts)? {
+                                    Some(d) => crate::proto::render_if_envelope(registry.as_deref(), d)?,
+                                    None => Value::Null,
+                                }
                             };
                         }
                         rows.push(row);
@@ -418,7 +462,8 @@ async fn all_docs_inner(
             if include_docs {
                 if let Some(w) = fdi.rev_tree.winner() {
                     crate::metrics::bump(&crate::metrics::DATABASE_READS);
-                    row["doc"] = snap.doc_json(&fdi, &w, &opts)?;
+                    let raw = snap.doc_json(&fdi, &w, &opts)?;
+                    row["doc"] = crate::proto::render_if_envelope(registry.as_deref(), raw)?;
                 }
             }
             rows.push(row);

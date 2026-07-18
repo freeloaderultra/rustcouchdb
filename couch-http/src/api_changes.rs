@@ -27,6 +27,9 @@ struct ChangesOpts {
     doc_ids: Option<Vec<String>>,
     selector: Option<Arc<couch_mango::Selector>>,
     limit: u64,
+    /// For proto-native docs: selector matching and include_docs work on
+    /// the rendered domain view, never the raw envelope.
+    registry: Option<Arc<couch_proto::Registry>>,
 }
 
 fn parse_opts(q: &Q, body: &Value) -> ApiResult<ChangesOpts> {
@@ -75,6 +78,7 @@ fn parse_opts(q: &Q, body: &Value) -> ApiResult<ChangesOpts> {
         doc_ids,
         selector,
         limit: qu64(q, "limit").unwrap_or(u64::MAX).max(1),
+        registry: None,
     })
 }
 
@@ -100,7 +104,8 @@ fn change_row(snap: &Db, fdi: &FullDocInfo, opts: &ChangesOpts) -> couch_store::
             ..Default::default()
         };
         crate::metrics::bump(&crate::metrics::DATABASE_READS);
-        Some(snap.doc_json(fdi, &winner, &dopts)?)
+        let raw = snap.doc_json(fdi, &winner, &dopts)?;
+        Some(crate::proto::render_if_envelope(opts.registry.as_deref(), raw)?)
     } else {
         None
     };
@@ -190,7 +195,10 @@ async fn changes_inner(
     body: Value,
 ) -> ApiResult<Response> {
     let dbh = state.db(&db)?;
-    let opts = parse_opts(&q, &body)?;
+    let mut opts = parse_opts(&q, &body)?;
+    if opts.include_docs || opts.selector.is_some() {
+        opts.registry = blocking(|| state.proto_registry())?;
+    }
     let update_seq = dbh.snapshot().header.update_seq;
     let since = parse_seq(q.get("since").map(|s| s.as_str()).unwrap_or("0"), update_seq);
     let feed = q.get("feed").map(|s| s.as_str()).unwrap_or("normal").to_string();

@@ -81,12 +81,37 @@ pub enum AttInput {
     },
 }
 
+/// What a revision stores as its body: classic EJSON, or protobuf message
+/// bytes with their type name (rendered upward as the `$pb_*` envelope).
+pub enum BodyInput {
+    Json(Value),
+    Proto { type_name: String, bytes: Vec<u8> },
+}
+
+impl BodyInput {
+    fn external_size(&self) -> usize {
+        match self {
+            BodyInput::Json(v) => ejson::external_size(v),
+            BodyInput::Proto { type_name, bytes } => type_name.len() + bytes.len(),
+        }
+    }
+
+    fn to_term(&self) -> Term {
+        match self {
+            BodyInput::Json(v) => ejson::from_json(v),
+            BodyInput::Proto { type_name, bytes } => {
+                doc::proto_body_term(type_name, bytes.clone())
+            }
+        }
+    }
+}
+
 pub struct DocUpdate {
     pub id: Vec<u8>,
     /// (pos, [leaf_revid, parent_revid, ...])
     pub rev_path: (u64, Vec<Vec<u8>>),
     pub deleted: bool,
-    pub body: Value,
+    pub body: BodyInput,
     pub atts: Vec<AttInput>,
 }
 
@@ -203,8 +228,68 @@ impl DocUpdate {
             id,
             rev_path,
             deleted,
-            body: v,
+            body: BodyInput::Json(v),
             atts,
+        })
+    }
+
+    /// Build a DocUpdate from a replicated proto envelope (`new_edits:false`
+    /// path): the rev history comes from `_revisions`/`_rev` exactly like
+    /// JSON docs; the body is the message bytes verbatim. Proto documents
+    /// carry no attachments.
+    pub fn from_proto_envelope(v: &Value, type_name: String, bytes: Vec<u8>) -> Result<DocUpdate> {
+        let obj = v
+            .as_object()
+            .ok_or_else(|| Error::BadRequest("doc is not an object".into()))?;
+        let id = match obj.get("_id") {
+            Some(Value::String(s)) => s.clone().into_bytes(),
+            _ => return Err(Error::BadRequest("doc missing _id".into())),
+        };
+        let deleted = matches!(obj.get("_deleted"), Some(Value::Bool(true)));
+        if obj
+            .get("_attachments")
+            .and_then(|a| a.as_object())
+            .is_some_and(|a| !a.is_empty())
+        {
+            return Err(Error::BadRequest(
+                "proto documents cannot carry attachments".into(),
+            ));
+        }
+        let rev_path = if let Some(revs) = obj.get("_revisions") {
+            let start = revs
+                .get("start")
+                .and_then(|s| s.as_u64())
+                .ok_or_else(|| Error::BadRequest("bad _revisions.start".into()))?;
+            let ids = revs
+                .get("ids")
+                .and_then(|i| i.as_array())
+                .ok_or_else(|| Error::BadRequest("bad _revisions.ids".into()))?;
+            let path: Vec<Vec<u8>> = ids
+                .iter()
+                .map(|r| {
+                    r.as_str()
+                        .map(doc::parse_revid)
+                        .ok_or_else(|| Error::BadRequest("bad _revisions id".into()))
+                })
+                .collect::<Result<_>>()?;
+            if path.is_empty() {
+                return Err(Error::BadRequest("_revisions.ids is empty".into()));
+            }
+            (start, path)
+        } else if let Some(Value::String(r)) = obj.get("_rev") {
+            let (pos, revid) = doc::parse_rev(r)?;
+            (pos, vec![revid])
+        } else {
+            return Err(Error::BadRequest(
+                "replicated proto doc needs _rev or _revisions".into(),
+            ));
+        };
+        Ok(DocUpdate {
+            id,
+            rev_path,
+            deleted,
+            body: BodyInput::Proto { type_name, bytes },
+            atts: Vec::new(),
         })
     }
 }
@@ -412,7 +497,7 @@ impl DbWriter {
                     }
                 }
             }
-            let body_term = ejson::from_json(&upd.body);
+            let body_term = upd.body.to_term();
             let body_bin = crate::compress::compress(&body_term);
             let atts_bin = crate::compress::compress(&Term::List(att_terms));
             let summary = crate::etf::encode(&Term::Tuple(vec![
@@ -425,7 +510,7 @@ impl DbWriter {
                 deleted: upd.deleted,
                 ptr: Some(ptr),
                 seq: PENDING_SEQ,
-                sizes: (written as i64, ejson::external_size(&upd.body) as i64),
+                sizes: (written as i64, upd.body.external_size() as i64),
                 atts: Term::List(leaf_att_sizes),
             };
             let (start, chain) = path_to_tree(*pos, path, leaf);
@@ -566,7 +651,9 @@ impl DbWriter {
             let old = match &parent {
                 Some((pos, path, Some(ptr), was_deleted)) if !was_deleted => {
                     let summary = doc::read_summary(&self.file, *ptr)?;
-                    let mut m = match ejson::to_json(&summary.body)? {
+                    // Proto parents surface as the $pb envelope; the
+                    // validator wrapper decodes it when it needs fields.
+                    let mut m = match doc::body_json(&summary.body)? {
                         Value::Object(o) => o,
                         _ => Default::default(),
                     };
@@ -582,7 +669,7 @@ impl DbWriter {
         }
 
         // Strip metadata; what remains is the stored body.
-        let mut body = doc.clone();
+        let mut body: Value = doc.clone();
         let bobj = body.as_object_mut().expect("checked above");
         for meta in [
             "_id", "_rev", "_revisions", "_deleted", "_attachments", "_conflicts",
@@ -689,13 +776,147 @@ impl DbWriter {
             id: id.into_bytes(),
             rev_path: (new_pos, path),
             deleted,
-            body,
+            body: BodyInput::Json(body),
             atts,
         }])?;
         debug_assert_eq!(n, 1);
         Ok(SaveOutcome::Ok {
             rev: doc::rev_str(new_pos, &new_revid),
         })
+    }
+
+    /// Interactive save of a proto-bodied document — the PUT semantics of
+    /// [`DbWriter::save_doc`] for `Content-Type: application/protobuf`.
+    /// `view` is the caller's decoded JSON view of the message (callers hold
+    /// the schema registry; the writer doesn't): it is what the validation
+    /// hook sees as the new document, alongside the parent's body JSON
+    /// (envelope form for proto parents). Proto docs carry no attachments.
+    pub fn save_proto_doc(
+        &mut self,
+        id: &str,
+        rev: Option<&str>,
+        deleted: bool,
+        type_name: &str,
+        bytes: Vec<u8>,
+        view: &Value,
+        validate: Option<Validator<'_>>,
+    ) -> Result<SaveOutcome> {
+        if id.starts_with('_') {
+            return Ok(SaveOutcome::error(
+                "bad_request",
+                "proto documents cannot use reserved ids",
+            ));
+        }
+        let rev = match rev {
+            Some(r) => Some(doc::parse_rev(r)?),
+            None => None,
+        };
+
+        let key = Term::Bin(id.as_bytes().to_vec());
+        let found = btree::lookup(&self.file, &self.id_root, std::slice::from_ref(&key))?
+            .pop()
+            .flatten();
+        let fdi = match &found {
+            Some(v) => Some(Db::fdi_from_id_kv(&key, v)?),
+            None => None,
+        };
+        let parent: Option<(u64, Vec<Vec<u8>>, Option<u64>, bool)> = match (&fdi, &rev) {
+            (None, None) => None,
+            (None, Some(_)) => return Ok(SaveOutcome::conflict()),
+            (Some(f), maybe_rev) => {
+                let leaves = f.rev_tree.leaves();
+                let chosen = match maybe_rev {
+                    Some((pos, revid)) => leaves
+                        .into_iter()
+                        .find(|l| l.pos == *pos && l.path[0] == revid.as_slice()),
+                    None => match f.rev_tree.winner() {
+                        Some(w) if matches!(w.leaf, RevVal::Leaf(l) if l.deleted) => Some(w),
+                        _ => return Ok(SaveOutcome::conflict()),
+                    },
+                };
+                match chosen {
+                    None => return Ok(SaveOutcome::conflict()),
+                    Some(l) => {
+                        let (ptr, was_deleted) = match l.leaf {
+                            RevVal::Leaf(lv) => (lv.ptr, lv.deleted),
+                            RevVal::Missing => (None, false),
+                        };
+                        Some((
+                            l.pos,
+                            l.path.iter().map(|r| r.to_vec()).collect(),
+                            ptr,
+                            was_deleted,
+                        ))
+                    }
+                }
+            }
+        };
+
+        if let Some(validate) = validate {
+            let old = match &parent {
+                Some((pos, path, Some(ptr), was_deleted)) if !was_deleted => {
+                    let summary = doc::read_summary(&self.file, *ptr)?;
+                    let mut m = match doc::body_json(&summary.body)? {
+                        Value::Object(o) => o,
+                        _ => Default::default(),
+                    };
+                    m.insert("_id".into(), Value::String(id.to_string()));
+                    m.insert("_rev".into(), Value::String(doc::rev_str(*pos, &path[0])));
+                    Some(Value::Object(m))
+                }
+                _ => None,
+            };
+            if let Err(reason) = validate(view, old.as_ref()) {
+                return Ok(SaveOutcome::error("forbidden", reason));
+            }
+        }
+
+        // Deterministic new revid over the parent rev, deletion flag, type
+        // and message bytes.
+        let (new_pos, mut path) = match &parent {
+            Some((pos, path, _, _)) => (*pos + 1, path.clone()),
+            None => (1, Vec::new()),
+        };
+        let mut h = Md5::new();
+        h.update(id.as_bytes());
+        h.update([deleted as u8]);
+        if let Some((pos, path, _, _)) = &parent {
+            h.update(pos.to_le_bytes());
+            h.update(&path[0]);
+        }
+        h.update(type_name.as_bytes());
+        h.update(&bytes);
+        let new_revid = h.finalize().to_vec();
+        path.insert(0, new_revid.clone());
+
+        let n = self.update_docs(vec![DocUpdate {
+            id: id.as_bytes().to_vec(),
+            rev_path: (new_pos, path),
+            deleted,
+            body: BodyInput::Proto {
+                type_name: type_name.to_string(),
+                bytes,
+            },
+            atts: Vec::new(),
+        }])?;
+        debug_assert_eq!(n, 1);
+        Ok(SaveOutcome::Ok {
+            rev: doc::rev_str(new_pos, &new_revid),
+        })
+    }
+
+    /// Mark this database proto-native (set once by creation or migration;
+    /// the flag lives in the header's props slot and survives compaction).
+    /// JSON application documents are rejected in proto-native databases —
+    /// enforcement lives in the HTTP layer, which knows the doc class.
+    pub fn mark_proto_native(&mut self) -> Result<()> {
+        let t = Term::List(vec![Term::Tuple(vec![
+            Term::Bin(b"proto_native".to_vec()),
+            Term::atom("true"),
+        ])]);
+        let (ptr, _) = self.file.append_term(&t)?;
+        self.header.props_ptr = Term::Int(ptr as i64);
+        Ok(())
     }
 
     /// Replace the `_security` object (takes effect at the next commit).
@@ -1207,6 +1428,83 @@ mod tests {
 
     /// Spooled attachments: multi-chunk write from a temp file, byte-exact
     /// read-back, and survival through compaction (which re-chunks).
+    #[test]
+    fn proto_body_roundtrip_replicate_compact() {
+        use base64::Engine as _;
+        let path = tmppath("protobody.couch");
+        let bytes: Vec<u8> = vec![0x0a, 3, b'a', b'b', b'c', 0x11, 0, 0, 0, 0, 0, 0, 0x24, 0x40];
+
+        let rev1 = {
+            let mut w = DbWriter::create(&path).unwrap();
+            w.mark_proto_native().unwrap();
+            let out = w
+                .save_proto_doc("d1", None, false, "test.v1.Thing", bytes.clone(),
+                                &json!({"name": "abc"}), None)
+                .unwrap();
+            let SaveOutcome::Ok { rev } = out else { panic!("{out:?}") };
+            // JSON app docs are the http layer's job to reject; the store
+            // accepts both. Reserved ids are rejected for proto docs.
+            let out = w
+                .save_proto_doc("_design/x", None, false, "t", vec![], &json!({}), None)
+                .unwrap();
+            assert!(matches!(out, SaveOutcome::Error { .. }));
+            w.commit().unwrap();
+            rev
+        };
+
+        let check = |path: &str, rev: &str| {
+            let db = Db::open(path).unwrap();
+            assert!(db.proto_native());
+            let doc = db.open_doc(b"d1", None, &Default::default()).unwrap().unwrap();
+            assert_eq!(doc["_rev"], json!(rev));
+            assert_eq!(doc["$pb_type"], json!("test.v1.Thing"));
+            let got = base64::engine::general_purpose::STANDARD
+                .decode(doc["$pb_body"].as_str().unwrap())
+                .unwrap();
+            assert_eq!(got, bytes);
+            doc
+        };
+        let doc = check(&path, &rev1);
+
+        // Update through the interactive path (rev checked, new revid).
+        {
+            let mut w = DbWriter::open(&path).unwrap();
+            let out = w
+                .save_proto_doc("d1", Some(&rev1), false, "test.v1.Thing",
+                                vec![0x08, 0x2a], &json!({"n": 42}), None)
+                .unwrap();
+            assert!(matches!(out, SaveOutcome::Ok { .. }), "{out:?}");
+            // Stale rev conflicts.
+            let out = w
+                .save_proto_doc("d1", Some(&rev1), false, "test.v1.Thing",
+                                vec![], &json!({}), None)
+                .unwrap();
+            assert!(matches!(out, SaveOutcome::Error { ref error, .. } if error == "conflict"));
+            w.commit().unwrap();
+        }
+
+        // Replicated intake (new_edits:false) of the envelope into a fresh db.
+        let path2 = tmppath("protobody2.couch");
+        {
+            let mut w = DbWriter::create(&path2).unwrap();
+            w.mark_proto_native().unwrap();
+            let env = json!({
+                "_id": "d1", "_rev": doc["_rev"],
+                "_revisions": {"start": 1, "ids": [doc["_rev"].as_str().unwrap()
+                    .strip_prefix("1-").unwrap()]},
+            });
+            let upd = DocUpdate::from_proto_envelope(&env, "test.v1.Thing".into(), bytes.clone())
+                .unwrap();
+            assert_eq!(w.update_docs(vec![upd]).unwrap(), 1);
+            w.commit().unwrap();
+        }
+        check(&path2, &rev1);
+
+        // Compaction preserves proto bodies and the proto_native marker.
+        crate::compact::compact(&path2).unwrap();
+        check(&path2, &rev1);
+    }
+
     #[test]
     fn att_reader_skips_chunks_without_reading() {
         use std::io::{Seek, SeekFrom, Write};

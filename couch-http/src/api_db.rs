@@ -4,7 +4,7 @@
 use crate::error::{ApiError, ApiResult};
 use crate::state::{blocking, App};
 use crate::util::parse_json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -32,8 +32,24 @@ pub async fn db_info(State(state): State<App>, Path(db): Path<String>) -> ApiRes
     })
 }
 
-pub async fn db_create(State(state): State<App>, Path(db): Path<String>) -> ApiResult<Response> {
-    blocking(|| state.create_db(&db))?;
+pub async fn db_create(
+    State(state): State<App>,
+    Path(db): Path<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> ApiResult<Response> {
+    // ?proto=true creates a proto-native database: application documents
+    // are protobuf-bodied; JSON app writes are rejected.
+    let proto = q.get("proto").map(|v| v == "true").unwrap_or(false);
+    blocking(|| -> ApiResult<()> {
+        let dbh = state.create_db(&db)?;
+        if proto {
+            dbh.with_writer(|w| {
+                w.mark_proto_native()?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    })?;
     Ok((StatusCode::CREATED, Json(json!({"ok": true}))).into_response())
 }
 
