@@ -227,10 +227,14 @@ pub async fn find(
     let t0 = std::time::Instant::now();
     let v = parse_json(&body)?;
     let want_stats = matches!(v.get("execution_stats"), Some(Value::Bool(true)));
-    // Proto-body negotiation: a proto-aware client asks (via the request
-    // body flag — kivik-friendly — or the header) for stored $pb envelopes
-    // instead of rendered JSON views, and decodes the bytes itself.
-    let proto_bodies = matches!(v.get("proto_bodies"), Some(Value::Bool(true)))
+    // Body-format negotiation. `Accept: application/x-protobuf` → a binary
+    // FindResponse (no JSON, no base64). The `proto_bodies` flag (body or
+    // header) → JSON results carrying the $pb envelope for clients that
+    // still parse JSON. Both need the stored bytes, so both set proto_bodies
+    // internally; only the framing of the response differs.
+    let proto_response = crate::proto::wants_proto_response(&headers);
+    let proto_bodies = proto_response
+        || matches!(v.get("proto_bodies"), Some(Value::Bool(true)))
         || crate::proto::wants_proto_bodies(&headers);
     let dbh = state.db(&db)?;
     let fq = FindQuery::parse(&v)?;
@@ -290,6 +294,17 @@ pub async fn find(
                 Ok(())
             },
         )?;
+        // Pure-binary response: a FindResponse proto, raw message bytes,
+        // no JSON envelope and no base64.
+        if proto_response {
+            let body = crate::proto::encode_find_response(&docs, "nil")?;
+            let mut r = (StatusCode::OK, body).into_response();
+            r.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static(crate::proto::PROTO_ACCEPT),
+            );
+            return Ok(r);
+        }
         let mut resp = json!({"docs": docs, "bookmark": "nil"});
         if chosen.is_none() {
             resp["warning"] = json!(

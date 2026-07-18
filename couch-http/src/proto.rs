@@ -264,6 +264,84 @@ fn corrupt(msg: impl Into<String>) -> couch_store::error::Error {
     couch_store::error::Error::Corrupt(msg.into())
 }
 
+// ---- pure-binary query responses -------------------------------------
+//
+// A proto-aware client sends `Accept: application/x-protobuf` on _find and
+// gets a binary `FindResponse` back — no JSON envelope, no base64. The wire
+// contract (matched by the Go client in protobase.go):
+//
+//   message FindResponse { repeated FindRow rows = 1; string bookmark = 2; }
+//   message FindRow { string id = 1; string rev = 2;
+//                     string type = 3; bytes body = 4; }
+//
+// `body` is the raw stored message bytes (a protobuf `bytes` field is raw on
+// the wire — base64 only ever appears when proto is rendered into JSON).
+
+pub const PROTO_ACCEPT: &str = "application/x-protobuf";
+
+pub fn wants_proto_response(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|a| a.contains("application/x-protobuf") || a.contains("application/protobuf"))
+        .unwrap_or(false)
+}
+
+fn put_varint(buf: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            buf.push(b);
+            break;
+        }
+        buf.push(b | 0x80);
+    }
+}
+
+fn put_len_field(buf: &mut Vec<u8>, field: u32, data: &[u8]) {
+    put_varint(buf, ((field as u64) << 3) | 2);
+    put_varint(buf, data.len() as u64);
+    buf.extend_from_slice(data);
+}
+
+/// Encode a `FindResponse` from the collected `$pb` envelope docs. Each doc
+/// must be a proto envelope (a proto-native db yields only those from
+/// _find). `body` carries the raw message bytes (base64-decoded out of the
+/// envelope's transport form).
+pub fn encode_find_response(
+    docs: &[Value],
+    bookmark: &str,
+) -> Result<Vec<u8>, couch_store::error::Error> {
+    use base64::Engine as _;
+    let mut out = Vec::new();
+    for doc in docs {
+        let id = doc.get("_id").and_then(|v| v.as_str()).unwrap_or("");
+        let rev = doc.get("_rev").and_then(|v| v.as_str()).unwrap_or("");
+        let ty = doc.get(PB_TYPE).and_then(|v| v.as_str()).ok_or_else(|| {
+            corrupt(format!(
+                "{id}: _find with Accept: {PROTO_ACCEPT} but doc is not a proto document"
+            ))
+        })?;
+        let b64 = doc.get(PB_BODY).and_then(|v| v.as_str()).ok_or_else(|| {
+            corrupt(format!("{id}: proto envelope without $pb_body"))
+        })?;
+        let body = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| corrupt(format!("{id}: bad $pb_body: {e}")))?;
+        let mut row = Vec::new();
+        put_len_field(&mut row, 1, id.as_bytes());
+        put_len_field(&mut row, 2, rev.as_bytes());
+        put_len_field(&mut row, 3, ty.as_bytes());
+        put_len_field(&mut row, 4, &body);
+        put_len_field(&mut out, 1, &row); // FindResponse.rows
+    }
+    if !bookmark.is_empty() {
+        put_len_field(&mut out, 2, bookmark.as_bytes());
+    }
+    Ok(out)
+}
+
 // ---- proto-native document bodies ------------------------------------
 
 /// Envelope keys couch-store emits for proto bodies (`doc::body_json`).
