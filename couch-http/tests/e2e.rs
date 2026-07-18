@@ -2015,9 +2015,12 @@ async fn proto_native_documents() {
     assert_eq!(s, 200);
     let f2 = v["docs"].as_array().unwrap().iter().find(|d| d["_id"] == "f2").unwrap();
     assert_eq!(f2["$pb_type"], json!("test.v1.FieldBoundary"), "want envelope, got {f2}");
-    assert!(f2.get("area").is_none(), "envelope must not be pre-rendered");
+    assert!(f2.get("area").is_none(), "heavy body must not be pre-rendered");
     let raw = base64_decode(f2["$pb_body"].as_str().unwrap());
     assert_eq!(raw, boundary_blob("f2", 150.0, 1.0, 2.0, 9));
+    // the small db sub-message is attached (extracted, not full render) so
+    // map-based client resolution/ACL keeps working — our test schema has
+    // no db field, so it's simply absent here; a real nxguide doc carries it.
     // _all_docs and _changes honor the query-param form.
     let (_, v) = jget(&c, &format!("{b}/pn/_all_docs?include_docs=true&proto_bodies=true")).await;
     let doc = v["rows"].as_array().unwrap().iter().find(|r| r["id"] == "f2").unwrap();

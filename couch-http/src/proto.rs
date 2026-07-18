@@ -349,18 +349,53 @@ pub fn wants_proto_bodies(headers: &axum::http::HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// A query-result doc for the given body-format choice: the stored envelope
-/// verbatim when the client wants proto bodies, otherwise the rendered view.
+/// A query-result doc for the given body-format choice.
+///
+/// Without proto-bodies: envelopes render to the readable JSON view.
+///
+/// With proto-bodies: the stored envelope is returned verbatim (raw message
+/// bytes in `$pb_body`) so the client decodes it directly — but the small
+/// `db` sub-message is extracted from the wire bytes (O(db), skipping the
+/// heavy payload) and attached, so the client's map-based resolution, ACL
+/// and dedup logic keeps working without decoding the whole body. Non-proto
+/// docs pass through unchanged.
 pub fn present_doc(
     reg: Option<&Registry>,
     doc: Value,
     proto_bodies: bool,
 ) -> Result<Value, couch_store::error::Error> {
-    if proto_bodies {
-        Ok(doc)
-    } else {
-        render_if_envelope(reg, doc)
+    if !proto_bodies {
+        return render_if_envelope(reg, doc);
     }
+    if !is_envelope(&doc) {
+        return Ok(doc);
+    }
+    let (type_name, bytes) = envelope_parts(&doc)?;
+    let Some(reg) = reg else {
+        return Err(couch_store::error::Error::Unsupported(format!(
+            "proto document {type_name} but no schemas registered in _schemas"
+        )));
+    };
+    let desc = reg.resolve_full(&type_name).ok_or_else(|| {
+        couch_store::error::Error::Unsupported(format!(
+            "no schema registered for message {type_name:?}"
+        ))
+    })?;
+    let Value::Object(mut obj) = doc else {
+        return Err(corrupt("envelope is not an object"));
+    };
+    // Attach the extracted `db` sub-message (cheap: skips the payload).
+    if let Some(trie) = couch_proto::PathTrie::compile(&desc, &["db".to_string()]) {
+        let extracted = trie
+            .extract(&mut couch_proto::SliceReader(&bytes), bytes.len() as u64)
+            .map_err(|e| corrupt(format!("extract db from {type_name}: {e}")))?;
+        if let Value::Object(m) = extracted {
+            if let Some(dbval) = m.get("db") {
+                obj.insert("db".to_string(), dbval.clone());
+            }
+        }
+    }
+    Ok(Value::Object(obj))
 }
 
 /// Decoded (or extracted) message fields plus the doc's `_*` metadata —
