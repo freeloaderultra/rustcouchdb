@@ -11,7 +11,30 @@
 //!   silently failing per document.
 
 use serde_json::Value;
+use std::borrow::Cow;
 use std::cmp::Ordering;
+
+/// A document the selector can be evaluated against.
+///
+/// The matcher never materializes a whole document to JSON; it only asks for
+/// the fields the selector references. JSON documents resolve paths directly
+/// (borrowing); a proto-backed document navigates the message and honors proto3
+/// semantics — an unset scalar reads as its default value (no scalar presence),
+/// so `{"field": ""}` matches a message whose empty field is absent on the wire.
+pub trait Doc {
+    /// Resolve a dotted path (already split into segments). Returns `None` when
+    /// the path is genuinely absent (an unknown field, or an unset message
+    /// field); a present-or-defaulted value is returned as `Some`.
+    fn get_path(&self, path: &[String]) -> Option<Cow<'_, Value>>;
+}
+
+/// JSON documents resolve paths by direct tree traversal (CouchDB semantics:
+/// an absent key is truly missing, matching only `{$exists: false}`).
+impl Doc for Value {
+    fn get_path(&self, path: &[String]) -> Option<Cow<'_, Value>> {
+        get_path(self, path).map(Cow::Borrowed)
+    }
+}
 
 /// A compiled selector, ready for repeated matching.
 pub struct Selector {
@@ -72,7 +95,7 @@ impl Selector {
         Ok(Selector { root })
     }
 
-    pub fn matches(&self, doc: &Value) -> bool {
+    pub fn matches(&self, doc: &dyn Doc) -> bool {
         match_node(&self.root, doc)
     }
 }
@@ -291,21 +314,21 @@ fn negate_cond(c: Cond) -> Cond {
 
 // ---- matching ---------------------------------------------------------------
 
-fn match_node(n: &Node, v: &Value) -> bool {
+fn match_node(n: &Node, doc: &dyn Doc) -> bool {
     match n {
         Node::True => true,
         // Empty argument lists: $and, $or (and thus $nor) are vacuously true.
-        Node::And(cs) => cs.iter().all(|c| match_node(c, v)),
-        Node::Or(cs) => cs.is_empty() || cs.iter().any(|c| match_node(c, v)),
-        Node::Nor(cs) => cs.is_empty() || !cs.iter().any(|c| match_node(c, v)),
-        Node::Not(c) => !match_node(c, v),
-        Node::Field { path, cond } => match get_path(v, path) {
+        Node::And(cs) => cs.iter().all(|c| match_node(c, doc)),
+        Node::Or(cs) => cs.is_empty() || cs.iter().any(|c| match_node(c, doc)),
+        Node::Nor(cs) => cs.is_empty() || !cs.iter().any(|c| match_node(c, doc)),
+        Node::Not(c) => !match_node(c, doc),
+        Node::Field { path, cond } => match doc.get_path(path) {
             // A missing field only ever matches a literal {$exists: false}.
             None => matches!(cond, Cond::Exists(false)),
             Some(sub) => {
                 // _id comparisons use raw byte order, not collation.
                 let raw = path.len() == 1 && path[0] == "_id";
-                match_cond(cond, sub, raw)
+                match_cond(cond, &sub, raw)
             }
         },
     }

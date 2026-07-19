@@ -78,21 +78,17 @@ pub async fn replicate(
     );
     info!("replication id: {}", crate::ids::task_id(&rep_id, opts.continuous));
 
-    // Selector filtering always runs natively in couch-repl, applied to each
-    // fetched leaf revision after the parallel _bulk_get: the source never
-    // evaluates a filter (no couchjs, no per-row mango matching), and the
-    // changes feed stays lean.
-    let selector = opts
-        .filter
-        .selector
-        .as_ref()
-        .map(|s| {
-            couch_mango::Selector::compile(s)
-                .map_err(|e| Error::Protocol(format!("invalid selector: {e}")))
-        })
-        .transpose()?;
-    if selector.is_some() {
-        info!("selector filter: evaluating natively in couch-repl");
+    // Selector filtering runs SERVER-SIDE via the source's proto-aware
+    // _changes?filter=_selector (see ChangesReader): the source renders each
+    // proto doc's domain view and matches the Mango selector — identical to
+    // _find — so db.* fields inside the proto body are reachable. couch-repl
+    // no longer matches client-side (it only ever saw the raw $pb envelope,
+    // which has no top-level db, so every proto doc was wrongly filtered out).
+    if opts.filter.selector.is_some() {
+        // Validate early; the source compiles and applies it authoritatively.
+        couch_mango::Selector::compile(opts.filter.selector.as_ref().unwrap())
+            .map_err(|e| Error::Protocol(format!("invalid selector: {e}")))?;
+        info!("selector filter: evaluated server-side (proto-aware, like _find)");
     }
 
     let ledger = Arc::new(SeqLedger::new());
@@ -160,7 +156,8 @@ pub async fn replicate(
         concurrency: opts.fetch_concurrency,
         use_bulk_get: AtomicBool::new(opts.use_bulk_get),
         continue_on_error: opts.continue_on_error,
-        selector,
+        // Filtering is server-side now; the fetcher never matches client-side.
+        selector: None,
     });
     let fetcher_handle = tokio::spawn(fetcher.run(missing_rx, fetched_tx.clone(), att_tx));
 

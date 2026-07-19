@@ -100,24 +100,34 @@ fn change_row(snap: &Db, fdi: &FullDocInfo, opts: &ChangesOpts) -> couch_store::
     };
     let winner_rev = docmod::rev_str(winner.pos, winner.path[0]);
 
-    // The doc is needed for _selector filtering even without include_docs.
-    let doc = if opts.include_docs || opts.selector.is_some() {
+    // The raw stored doc is needed for _selector filtering even without
+    // include_docs. Keep it as the stored form ($pb envelope for proto docs) so
+    // the selector matches the message directly (proto3 defaults), rather than a
+    // rendered JSON view that omits empty fields.
+    let raw = if opts.include_docs || opts.selector.is_some() {
         let dopts = DocOpts {
             attachments: opts.attachments,
             conflicts: opts.conflicts,
             ..Default::default()
         };
         crate::metrics::bump(&crate::metrics::DATABASE_READS);
-        let raw = snap.doc_json(fdi, &winner, &dopts)?;
-        Some(crate::proto::present_doc(opts.registry.as_deref(), raw, opts.proto_bodies)?)
+        Some(snap.doc_json(fdi, &winner, &dopts)?)
     } else {
         None
     };
     if let Some(sel) = &opts.selector {
-        if !sel.matches(doc.as_ref().unwrap()) {
+        if !crate::proto::match_doc(opts.registry.as_deref(), raw.as_ref().unwrap(), sel)? {
             return Ok(None);
         }
     }
+    // The output doc (include_docs) renders the domain view (or passes the $pb
+    // envelope through for proto-aware clients).
+    let doc = match raw {
+        Some(raw) if opts.include_docs => {
+            Some(crate::proto::present_doc(opts.registry.as_deref(), raw, opts.proto_bodies)?)
+        }
+        _ => None,
+    };
 
     let mut changes = Vec::new();
     if opts.style_main_only {

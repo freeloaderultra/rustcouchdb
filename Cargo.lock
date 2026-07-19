@@ -370,6 +370,8 @@ dependencies = [
 name = "couch-proto"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "couch-mango",
  "prost",
  "prost-reflect",
  "prost-types",

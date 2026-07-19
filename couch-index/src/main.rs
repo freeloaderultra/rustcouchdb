@@ -208,6 +208,7 @@ fn run(cmd: Cmd) -> Result<()> {
                 &fq,
                 &selector,
                 None,
+                None,
                 &mut |doc| {
                     println_json(&doc);
                     Ok(())

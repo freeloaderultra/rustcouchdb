@@ -9,3 +9,5 @@ prost = "0.13"
 prost-types = "0.13"
 prost-reflect = { version = "0.14", features = ["serde"] }
 serde_json = "1"
+couch-mango = { path = "../couch-mango" }
+base64 = "0.22"

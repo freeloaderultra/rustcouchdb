@@ -15,6 +15,8 @@
 
 pub mod extract;
 pub use extract::{PathTrie, SkipRead, SliceReader};
+pub mod protodoc;
+pub use protodoc::ProtoDoc;
 
 use prost::Message as _;
 use prost_reflect::{DescriptorPool, DynamicMessage, MessageDescriptor};
@@ -282,11 +284,26 @@ pub(crate) mod tests {
         type_name: Option<&str>,
         repeated: bool,
     ) -> FieldDescriptorProto {
+        // Populate json_name (lowerCamelCase) as protoc/buf do, so descriptors
+        // built here resolve by json name like the production _schemas set.
+        let mut json_name = String::new();
+        let mut upper = false;
+        for ch in name.chars() {
+            if ch == '_' {
+                upper = true;
+            } else if upper {
+                json_name.extend(ch.to_uppercase());
+                upper = false;
+            } else {
+                json_name.push(ch);
+            }
+        }
         FieldDescriptorProto {
             name: Some(name.into()),
             number: Some(number),
             r#type: Some(typ as i32),
             type_name: type_name.map(String::from),
+            json_name: Some(json_name),
             label: Some(if repeated {
                 field_descriptor_proto::Label::Repeated as i32
             } else {

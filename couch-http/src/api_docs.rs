@@ -609,9 +609,22 @@ pub async fn doc_delete(
             let cur = snap
                 .open_doc(docid2.as_bytes(), None, &Default::default())?
                 .ok_or_else(ApiError::missing)?;
-            let (type_name, _) = crate::proto::envelope_parts(&cur)?;
+            let (type_name, cur_bytes) = crate::proto::envelope_parts(&cur)?;
             let reg = state.proto_registry()?;
-            let view = json!({"_id": docid2, "_rev": rev2, "_deleted": true});
+            // The tombstone keeps the deleted doc's proto body so its `db`
+            // ownership metadata survives: the soft-delete validator requires
+            // the tombstone to carry db, and replication scopes the tombstone
+            // by db.OwnerId. An empty-body tombstone drops db and is rejected
+            // by the validator ("soft delete requires db object") / mis-scoped
+            // in replication. The validator `view` is the decoded doc (db
+            // top-level) marked deleted.
+            let mut view = crate::proto::render_view(reg.as_deref(), &cur)
+                .unwrap_or_else(|_| json!({}));
+            if let Value::Object(m) = &mut view {
+                m.insert("_id".into(), json!(docid2));
+                m.insert("_rev".into(), json!(rev2));
+                m.insert("_deleted".into(), json!(true));
+            }
             let inner = state.validator_for(&db);
             let wrapped = inner.map(|v| crate::proto::wrap_validator(reg, v));
             let outcome = dbh.with_writer(|w| {
@@ -620,7 +633,7 @@ pub async fn doc_delete(
                     Some(&rev2),
                     true,
                     &type_name,
-                    Vec::new(),
+                    cur_bytes,
                     &view,
                     wrapped.as_ref().map(|w| w as _),
                 )

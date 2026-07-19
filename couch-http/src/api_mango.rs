@@ -237,7 +237,16 @@ pub async fn find(
         || matches!(v.get("proto_bodies"), Some(Value::Bool(true)))
         || crate::proto::wants_proto_bodies(&headers);
     let dbh = state.db(&db)?;
-    let fq = FindQuery::parse(&v)?;
+    let mut fq = FindQuery::parse(&v)?;
+    // A pure-binary FindResponse carries whole proto messages (FindRow.body is
+    // the full stored message); the client decodes and reads whatever fields it
+    // needs. A `fields` projection produces a projected domain-view JSON object
+    // with no $pb envelope, which cannot be re-encoded as a proto row — so the
+    // projection is meaningless (and breaks) on the proto path. Ignore it and
+    // return full envelopes.
+    if proto_response {
+        fq.fields = None;
+    }
     let selector = couch_mango::Selector::compile(&fq.selector)
         .map_err(|e| ApiError::bad_request(format!("invalid selector: {e}")))?;
 
@@ -245,6 +254,9 @@ pub async fn find(
     // and projections can reach fields inside protobuf blob attachments.
     let registry = blocking(|| state.proto_registry())?;
     let aug_fn = registry.clone().map(crate::proto::augmenter);
+    // Single matching path: evaluate the selector directly against the proto
+    // message on the wire (proto3 defaults honored, no JSON view materialized).
+    let match_fn = registry.clone().map(crate::proto::matcher);
 
     // Serialize index-file writes: choosing, materializing and updating the
     // index happen under the per-db lock. The scan itself runs after the
@@ -286,6 +298,7 @@ pub async fn find(
             &fq,
             &selector,
             aug_fn.as_ref().map(|f| f as _),
+            match_fn.as_ref().map(|f| f as _),
             &mut |doc| {
                 // Bare proto-native results come back as the stored $pb
                 // envelope; render them to the domain view (projected

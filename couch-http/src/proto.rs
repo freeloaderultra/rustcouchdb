@@ -161,6 +161,42 @@ pub fn validate_schemas_doc(doc: &Value) -> crate::error::ApiResult<()> {
     Ok(())
 }
 
+/// Evaluate a selector against a stored document: proto-native for `$pb`
+/// envelopes (navigate the message, honoring proto3 defaults — an unset scalar
+/// reads as its default; no whole-document JSON view is materialized) and plain
+/// JSON matching otherwise. A proto body that can't decode is an error.
+pub fn match_doc(
+    reg: Option<&Registry>,
+    doc: &Value,
+    selector: &couch_mango::Selector,
+) -> couch_store::error::Result<bool> {
+    if !is_envelope(doc) {
+        return Ok(selector.matches(doc));
+    }
+    let (type_name, bytes) = envelope_parts(doc)?;
+    let id = doc.get("_id").and_then(|v| v.as_str()).unwrap_or("?");
+    let reg = reg.ok_or_else(|| {
+        couch_store::error::Error::Unsupported(format!(
+            "{id}: proto document but no schemas are registered in _schemas"
+        ))
+    })?;
+    let desc = reg.resolve_full(&type_name).ok_or_else(|| {
+        couch_store::error::Error::Unsupported(format!(
+            "{id}: no schema registered for message {type_name:?}"
+        ))
+    })?;
+    Ok(selector.matches(&couch_proto::ProtoDoc::with_meta(desc, &bytes, doc)))
+}
+
+/// The Mango matcher (see `couch_index::find::DocMatch`): the single matching
+/// entry point, evaluating a selector against a stored document via
+/// [`match_doc`].
+pub fn matcher(
+    reg: Arc<Registry>,
+) -> impl Fn(&Value, &couch_mango::Selector) -> couch_store::error::Result<bool> {
+    move |doc, selector| match_doc(Some(&reg), doc, selector)
+}
+
 /// The Mango augmenter (see `couch_index::find::Augmenter`): resolves a
 /// doc's protobuf blob attachment through the registry and returns the
 /// decoded-and-overlaid view.

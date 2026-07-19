@@ -65,17 +65,24 @@ impl ChangesReader {
             ("style", style.to_string()),
             ("since", since.to_string()),
         ];
-        // Selectors are evaluated natively in couch-repl (in the fetch
-        // stage), never on the server; _doc_ids is a plain id-list
-        // restriction, not a filter function, so it stays server-side to
-        // shrink the feed.
-        if self.filter.doc_ids.is_some() {
+        // Proto-aware selector filtering runs SERVER-SIDE, the same way _find
+        // does: the source renders each proto doc's domain view (present_doc)
+        // and matches the Mango selector, so db.* fields living inside the
+        // proto body are reachable — a client-side match against the raw $pb
+        // envelope never sees them. _doc_ids is a plain id-list restriction.
+        // Selector takes precedence when both are set.
+        if self.filter.selector.is_some() {
+            q.push(("filter", "_selector".into()));
+        } else if self.filter.doc_ids.is_some() {
             q.push(("filter", "_doc_ids".into()));
         }
         q
     }
 
     fn filter_body(&self) -> Option<serde_json::Value> {
+        if let Some(sel) = &self.filter.selector {
+            return Some(serde_json::json!({ "selector": sel }));
+        }
         self.filter
             .doc_ids
             .as_ref()

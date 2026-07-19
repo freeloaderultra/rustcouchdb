@@ -1590,27 +1590,49 @@ fn boundary_blob(name: &str, area: f64, lat: f64, lon: f64, big: u64) -> Vec<u8>
     m
 }
 
-async fn put_blob_doc(c: &reqwest::Client, base: &str, db: &str, id: &str, doctype: &str, blob: &[u8]) {
-    let head = json!({"db": {"DocType": doctype, "IsBinaryBlob": true, "OwnerId": "u1"}});
-    let (s, v) = jput(c, &format!("{base}/{db}/{id}"), &head).await;
-    assert_eq!(s, 201, "{v}");
+/// Register the test descriptor set in `_schemas` and create a proto-native
+/// db — the representation nxguide actually uses (application docs ARE
+/// protobuf bytes, stored as `$pb` envelopes).
+async fn setup_proto_db(c: &reqwest::Client, base: &str, db: &str) {
+    assert_eq!(jput(c, &format!("{base}/_schemas"), &json!({})).await.0, 201);
+    let (_, v) = jput(c, &format!("{base}/_schemas/s"), &json!({})).await;
     let rev = v["rev"].as_str().unwrap();
     let r = c
-        .put(format!("{base}/{db}/{id}/blob.data?rev={rev}"))
-        .header("content-type", "application/protobuf")
-        .body(blob.to_vec())
+        .put(format!("{base}/_schemas/s/d.pb?rev={rev}"))
+        .header("content-type", "application/octet-stream")
+        .body(proto_descriptor_set())
         .send()
         .await
         .unwrap();
     assert_eq!(r.status().as_u16(), 201);
+    assert_eq!(
+        c.put(format!("{base}/{db}?proto=true")).send().await.unwrap().status().as_u16(),
+        201
+    );
 }
 
-/// The nxguide blob-document pattern: JSON head + `blob.data` protobuf
-/// attachment. With a FileDescriptorSet registered in `_schemas`, Mango
-/// selectors, projections and indexes reach fields inside the blob; without
-/// one (or for unregistered doctypes) blobs stay opaque and nothing changes.
+/// PUT a proto-native document: raw message bytes with the declared type,
+/// decoded and validated at the door, stored as a `$pb` envelope.
+async fn put_proto(c: &reqwest::Client, base: &str, db: &str, id: &str, ty: &str, blob: &[u8]) -> String {
+    let r = c
+        .put(format!("{base}/{db}/{id}"))
+        .header("content-type", "application/protobuf")
+        .header("x-proto-type", ty)
+        .body(blob.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 201, "put_proto {id}");
+    r.json::<Value>().await.unwrap()["rev"].as_str().unwrap().to_string()
+}
+
+/// Mango over proto-native documents: with a FileDescriptorSet registered in
+/// `_schemas`, selectors, projections and indexes reach fields inside the
+/// stored proto body — honoring proto3 wire semantics (int64 stringifies like
+/// protojson, defaults read as their zero value) without materializing a
+/// whole-document JSON view.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn proto_schema_mango() {
+async fn proto_mango_queries() {
     let srv = start(None, false).await;
     let c = client();
     let b = &srv.base;
@@ -1618,16 +1640,13 @@ async fn proto_schema_mango() {
     let (_, welcome) = jget(&c, b).await;
     assert!(welcome["features"].as_array().unwrap().iter().any(|f| f == "proto-schemas"));
 
-    jput(&c, &format!("{b}/pdb"), &json!({})).await;
-    put_blob_doc(&c, b, "pdb", "f1", "field_boundary", &boundary_blob("small", 50.0, 48.10, 11.5, 7)).await;
-    put_blob_doc(&c, b, "pdb", "f2", "field_boundary", &boundary_blob("mid", 150.0, 48.20, 11.6, 77)).await;
-    put_blob_doc(&c, b, "pdb", "f3", "field_boundary", &boundary_blob("big", 250.0, 48.30, 11.7, 777)).await;
-    put_blob_doc(&c, b, "pdb", "f4", "field_boundary", &boundary_blob("huge", 999.0, 48.40, 11.8, 7777)).await;
-    put_blob_doc(&c, b, "pdb", "m1", "mystery", &boundary_blob("who", 500.0, 0.0, 0.0, 1)).await;
-    let (s, _) = jput(&c, &format!("{b}/pdb/plain1"), &json!({"area": 700.0, "kind": "json"})).await;
-    assert_eq!(s, 201);
+    setup_proto_db(&c, b, "pdb").await;
+    let ty = "test.v1.FieldBoundary";
+    put_proto(&c, b, "pdb", "f1", ty, &boundary_blob("small", 50.0, 48.10, 11.5, 7)).await;
+    put_proto(&c, b, "pdb", "f2", ty, &boundary_blob("mid", 150.0, 48.20, 11.6, 77)).await;
+    put_proto(&c, b, "pdb", "f3", ty, &boundary_blob("big", 250.0, 48.30, 11.7, 777)).await;
+    put_proto(&c, b, "pdb", "f4", ty, &boundary_blob("huge", 999.0, 48.40, 11.8, 7777)).await;
 
-    let area_query = json!({"selector": {"area": {"$gte": 100}}, "limit": 50});
     let ids = |v: &Value| -> Vec<String> {
         let mut ids: Vec<String> = v["docs"]
             .as_array()
@@ -1639,40 +1658,31 @@ async fn proto_schema_mango() {
         ids
     };
 
-    // Without schemas the blobs are opaque: only the plain JSON doc matches.
-    let (s, v) = jpost(&c, &format!("{b}/pdb/_find"), &area_query).await;
-    assert_eq!(s, 200);
-    assert_eq!(ids(&v), vec!["plain1"]);
-
-    // Register the descriptor set (an ordinary db + doc + attachment).
-    assert_eq!(jput(&c, &format!("{b}/_schemas"), &json!({})).await.0, 201);
-    let (s, v) = jput(
+    // A double selector reaches inside the proto body.
+    let (s, v) = jpost(
         &c,
-        &format!("{b}/_schemas/nxguide"),
-        &json!({"doctypes": {"legacy_thing": "test.v1.FieldBoundary"}}),
+        &format!("{b}/pdb/_find"),
+        &json!({"selector": {"area": {"$gte": 100}}, "limit": 50}),
     )
     .await;
-    assert_eq!(s, 201);
-    let rev = v["rev"].as_str().unwrap();
-    let r = c
-        .put(format!("{b}/_schemas/nxguide/descriptor.pb?rev={rev}"))
-        .header("content-type", "application/octet-stream")
-        .body(proto_descriptor_set())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status().as_u16(), 201);
-
-    // Same query now reaches inside the blobs (registry cache invalidated by
-    // the _schemas write). Returned docs stay the stored heads.
-    let (s, v) = jpost(&c, &format!("{b}/pdb/_find"), &area_query).await;
     assert_eq!(s, 200);
-    assert_eq!(ids(&v), vec!["f2", "f3", "f4", "plain1"]);
+    assert_eq!(ids(&v), vec!["f2", "f3", "f4"]);
+    // Bare results are rendered views, not envelopes.
     let f2 = v["docs"].as_array().unwrap().iter().find(|d| d["_id"] == "f2").unwrap();
-    assert!(f2.get("area").is_none(), "bare docs must stay stored heads: {f2}");
-    assert_eq!(f2["db"]["DocType"], json!("field_boundary"));
+    assert_eq!(f2["area"], json!(150.0));
+    assert!(f2.get("$pb_type").is_none(), "view must not leak the envelope: {f2}");
 
-    // Projections may name blob-interior fields.
+    // int64 fields stringify exactly like protojson.
+    let (s, v) = jpost(
+        &c,
+        &format!("{b}/pdb/_find"),
+        &json!({"selector": {"bigCount": "77"}, "limit": 50}),
+    )
+    .await;
+    assert_eq!(s, 200);
+    assert_eq!(ids(&v), vec!["f2"]);
+
+    // Projections may name message-interior fields.
     let (s, v) = jpost(
         &c,
         &format!("{b}/pdb/_find"),
@@ -1688,34 +1698,7 @@ async fn proto_schema_mango() {
     assert_eq!(f3["area"], json!(250.0));
     assert_eq!(f3["topLeft"]["latitude"], json!(48.30));
 
-    // int64 fields stringify exactly like protojson.
-    let (s, v) = jpost(
-        &c,
-        &format!("{b}/pdb/_find"),
-        &json!({"selector": {"bigCount": "77"}, "limit": 50}),
-    )
-    .await;
-    assert_eq!(s, 200);
-    assert_eq!(ids(&v), vec!["f2"]);
-
-    // Unregistered doctypes stay opaque but remain findable by their head.
-    let (s, v) = jpost(
-        &c,
-        &format!("{b}/pdb/_find"),
-        &json!({"selector": {"db.DocType": "mystery", "area": {"$exists": true}}, "limit": 50}),
-    )
-    .await;
-    assert_eq!(s, 200);
-    assert!(ids(&v).is_empty());
-    let (_, v) = jpost(
-        &c,
-        &format!("{b}/pdb/_find"),
-        &json!({"selector": {"db.DocType": "mystery"}, "limit": 50}),
-    )
-    .await;
-    assert_eq!(ids(&v), vec!["m1"]);
-
-    // A Mango index on a blob-interior field: built through the decoder,
+    // A Mango index on a message-interior field: built through the decoder,
     // serves sorted range queries.
     let (s, v) = jpost(
         &c,
@@ -1745,12 +1728,10 @@ async fn proto_schema_mango() {
         .iter()
         .map(|d| d["_id"].as_str().unwrap().to_string())
         .collect();
-    // blob areas 150, 250, 999 collate with the plain doc's 700
-    assert_eq!(order, vec!["f2", "f3", "plain1", "f4"]);
+    assert_eq!(order, vec!["f2", "f3", "f4"]);
 
-    // Incremental index update keys a NEW blob doc through the decoder, and
-    // the explicit doctypes mapping resolves non-convention names.
-    put_blob_doc(&c, b, "pdb", "lg1", "legacy_thing", &boundary_blob("legacy", 100000.0, 1.0, 2.0, 5)).await;
+    // Incremental index update keys a NEW proto doc through the decoder too.
+    put_proto(&c, b, "pdb", "lg1", ty, &boundary_blob("legacy", 100000.0, 1.0, 2.0, 5)).await;
     let (s, v) = jpost(
         &c,
         &format!("{b}/pdb/_find"),
@@ -1786,28 +1767,18 @@ fn pb_bytes_long(field: u32, data: &[u8]) -> Vec<u8> {
     b
 }
 
-/// Index maintenance extracts only the indexed paths from blob wire bytes:
-/// a blob dominated by a huge field the index doesn't touch must still key
-/// correctly (the big field is skipped, not decoded), and the same doc must
-/// answer full-view selector queries too.
+/// Index maintenance extracts only the indexed paths from the proto wire
+/// bytes: a body dominated by a huge field the index doesn't touch must still
+/// key correctly (the big field is skipped by length, not decoded), and the
+/// same doc must answer full-view selector queries too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn proto_selective_extraction() {
     let srv = start(None, false).await;
     let c = client();
     let b = &srv.base;
 
-    jput(&c, &format!("{b}/xdb"), &json!({})).await;
-    assert_eq!(jput(&c, &format!("{b}/_schemas"), &json!({})).await.0, 201);
-    let (_, v) = jput(&c, &format!("{b}/_schemas/x"), &json!({})).await;
-    let rev = v["rev"].as_str().unwrap();
-    let r = c
-        .put(format!("{b}/_schemas/x/descriptor.pb?rev={rev}"))
-        .header("content-type", "application/octet-stream")
-        .body(proto_descriptor_set())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status().as_u16(), 201);
+    setup_proto_db(&c, b, "xdb").await;
+    let ty = "test.v1.FieldBoundary";
 
     // Index first, docs after: every doc is keyed by the incremental
     // updater, whose augmenter runs in extraction mode (fields, no pfs).
@@ -1819,12 +1790,12 @@ async fn proto_selective_extraction() {
     .await;
     assert_eq!(s, 200);
 
-    // 6 MiB of unknown-field payload dwarfing the wanted 9-byte area field
-    // (multi-chunk in couch-store, so skipping also skips disk chunks).
+    // 6 MiB of unknown-field payload dwarfing the wanted 9-byte area field;
+    // the extractor skips it by its announced length instead of decoding it.
     let mut blob = boundary_blob("giant", 424242.0, 3.0, 4.0, 9);
     blob.extend_from_slice(&pb_bytes_long(900, &vec![0x5Au8; 6 * 1024 * 1024]));
-    put_blob_doc(&c, b, "xdb", "big1", "field_boundary", &blob).await;
-    put_blob_doc(&c, b, "xdb", "small1", "field_boundary", &boundary_blob("s", 7.0, 1.0, 2.0, 1)).await;
+    put_proto(&c, b, "xdb", "big1", ty, &blob).await;
+    put_proto(&c, b, "xdb", "small1", ty, &boundary_blob("s", 7.0, 1.0, 2.0, 1)).await;
 
     let (s, v) = jpost(
         &c,
@@ -1836,8 +1807,8 @@ async fn proto_selective_extraction() {
     let ids: Vec<&str> = v["docs"].as_array().unwrap().iter().map(|d| d["_id"].as_str().unwrap()).collect();
     assert_eq!(ids, vec!["big1"]);
 
-    // Full-view path (selector on a non-indexed blob field) still works on
-    // the same doc — extraction and full decode agree.
+    // Full-view path (selector on a non-indexed field) still works on the
+    // same doc — extraction and full decode agree.
     let (s, v) = jpost(
         &c,
         &format!("{b}/xdb/_find"),
@@ -1852,16 +1823,16 @@ async fn proto_selective_extraction() {
 }
 
 /// No fallbacks: problems surface where they happen instead of degrading.
-/// Bad descriptor uploads are rejected at the door; a corrupt blob of a
-/// REGISTERED doctype fails the queries that touch it (and heals when the
-/// bad doc is removed); unregistered doctypes stay opaque by contract.
+/// Bad `_schemas` doc bodies and non-descriptor attachment uploads are
+/// rejected at the door; in a proto-native db every application write is
+/// decoded at the door, so corrupt bytes and unknown types are rejected
+/// before they can ever reach storage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn proto_strictness() {
     let srv = start(None, false).await;
     let c = client();
     let b = &srv.base;
 
-    jput(&c, &format!("{b}/sdb"), &json!({})).await;
     assert_eq!(jput(&c, &format!("{b}/_schemas"), &json!({})).await.0, 201);
 
     // Interactive _schemas writes are validated at the door.
@@ -1897,36 +1868,44 @@ async fn proto_strictness() {
         .unwrap();
     assert_eq!(r.status().as_u16(), 201);
 
-    put_blob_doc(&c, b, "sdb", "ok1", "field_boundary", &boundary_blob("fine", 10.0, 1.0, 2.0, 1)).await;
-    let q = json!({"selector": {"area": {"$gte": 1}}, "limit": 10});
-    let (s, v) = jpost(&c, &format!("{b}/sdb/_find"), &q).await;
-    assert_eq!(s, 200);
-    assert_eq!(v["docs"].as_array().unwrap().len(), 1);
+    // A proto-native db: writes are decoded at the door.
+    assert_eq!(
+        c.put(format!("{b}/sdb?proto=true")).send().await.unwrap().status().as_u16(),
+        201
+    );
 
-    // A corrupt blob of a REGISTERED doctype fails queries that touch it —
-    // loudly, instead of being silently treated as opaque.
+    // Corrupt bytes of a REGISTERED type are rejected at the door — loudly,
+    // instead of quietly landing an undecodable body in storage.
     // (0x1a = field 3 length-delimited, length 0xff, then nothing.)
-    put_blob_doc(&c, b, "sdb", "corrupt1", "field_boundary", &[0x1a, 0xff, 0x01]).await;
-    let (s, v) = jpost(&c, &format!("{b}/sdb/_find"), &q).await;
-    assert_eq!(s, 500, "corrupt registered blob must fail the query, got: {v}");
-
-    // Removing the bad doc heals the database.
-    let (_, v) = jget(&c, &format!("{b}/sdb/corrupt1")).await;
-    let rev = v["_rev"].as_str().unwrap();
     let r = c
-        .delete(format!("{b}/sdb/corrupt1?rev={rev}"))
+        .put(format!("{b}/sdb/corrupt1"))
+        .header("content-type", "application/protobuf")
+        .header("x-proto-type", "test.v1.FieldBoundary")
+        .body(vec![0x1a, 0xffu8, 0x01])
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status().as_u16(), 200);
-    let (s, v) = jpost(&c, &format!("{b}/sdb/_find"), &q).await;
-    assert_eq!(s, 200, "{v}");
-    assert_eq!(v["docs"].as_array().unwrap().len(), 1);
+    assert_eq!(r.status().as_u16(), 400, "corrupt proto must be rejected at the door");
 
-    // Unregistered doctypes are opaque by contract, not by failure: the
-    // same corrupt bytes under an unknown doctype don't error anything.
-    put_blob_doc(&c, b, "sdb", "unk1", "not_registered", &[0x1a, 0xff, 0x01]).await;
-    let (s, v) = jpost(&c, &format!("{b}/sdb/_find"), &q).await;
+    // An unknown message type is rejected too — nothing to decode against.
+    let r = c
+        .put(format!("{b}/sdb/unk1"))
+        .header("content-type", "application/protobuf")
+        .header("x-proto-type", "test.v1.NotRegistered")
+        .body(boundary_blob("x", 1.0, 1.0, 1.0, 1))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 400, "unknown type must be rejected at the door");
+
+    // A good proto doc stores and queries fine — the db is healthy.
+    put_proto(&c, b, "sdb", "ok1", "test.v1.FieldBoundary", &boundary_blob("fine", 10.0, 1.0, 2.0, 1)).await;
+    let (s, v) = jpost(
+        &c,
+        &format!("{b}/sdb/_find"),
+        &json!({"selector": {"area": {"$gte": 1}}, "limit": 10}),
+    )
+    .await;
     assert_eq!(s, 200, "{v}");
     assert_eq!(v["docs"].as_array().unwrap().len(), 1);
 }
